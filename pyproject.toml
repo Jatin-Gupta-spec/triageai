@@ -1,0 +1,23 @@
+[project]
+name = "triageai"
+version = "0.1.0"
+description = "Offline-first, human-in-the-loop SOC triage assistant."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pip-audit>=2.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
