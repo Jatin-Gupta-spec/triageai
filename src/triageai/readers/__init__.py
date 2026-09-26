@@ -1,0 +1,1 @@
+"""Input readers for TriageAI. Currently: sanitized Wazuh-style JSON."""
