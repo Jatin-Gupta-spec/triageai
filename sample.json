@@ -1,1 +1,0 @@
-{"host": "WIN-CLIENT01", "user": "alice@corp.local", "event_id": "4625", "command_line": "net user alice@corp.local /active:yes"}
