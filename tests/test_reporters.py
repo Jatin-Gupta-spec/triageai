@@ -1,8 +1,8 @@
 """Tests for terminal.py and markdown_report.py rendering.
 
-Stage 14 changes both renderers' signature to also take an
-ai_drafts dict (case_id -> AIAnalysisDraft | None), rendering either
-the draft's content or an explicit rejection notice.
+This fix adds hostile-input tests proving structural/control-character
+injection is neutralized -- previously, neither renderer sanitized
+untrusted field content at all.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from triageai.reporters.markdown_report import render_markdown
 from triageai.reporters.terminal import render_text
 
 
-def _event(command_line: str | None = None) -> NormalizedEvent:
+def _event(command_line: str | None = None, process: str | None = "powershell.exe") -> NormalizedEvent:
     return NormalizedEvent(
         original_record_id="rec-1",
         timestamp=datetime(2026, 1, 1, tzinfo=UTC),
@@ -24,7 +24,7 @@ def _event(command_line: str | None = None) -> NormalizedEvent:
         event_id="4625",
         provider=None,
         rule_id=None,
-        process="powershell.exe",
+        process=process,
         parent_process=None,
         command_line=command_line,
         source_ip=None,
@@ -41,9 +41,10 @@ def _case(
     observed_facts: tuple[str, ...] = (),
     evidence_gaps: tuple[str, ...] = (),
     command_line: str | None = None,
+    process: str | None = "powershell.exe",
     case_id: str = "case-1",
 ) -> Case:
-    event = _event(command_line=command_line)
+    event = _event(command_line=command_line, process=process)
     return Case(
         case_id=case_id,
         first_seen=event.timestamp,
@@ -160,10 +161,7 @@ def test_render_text_marks_undated_events() -> None:
 
 
 def test_render_text_separates_multiple_cases() -> None:
-    output = render_text(
-        (_case(case_id="case-1"), _case(case_id="case-2")),
-        {"case-1": None, "case-2": None},
-    )
+    output = render_text((_case(case_id="case-1"), _case(case_id="case-2")), {"case-1": None, "case-2": None})
     assert output.count("=== Case") == 2
 
 
@@ -205,3 +203,35 @@ def test_render_markdown_shows_accepted_ai_draft() -> None:
 def test_render_markdown_shows_rejection_notice_for_none_draft() -> None:
     output = render_markdown((_case(),), {"case-1": None})
     assert "REJECTED" in output
+
+
+# --- This fix: hostile-input injection resistance ---
+
+
+def test_render_text_strips_ansi_escape_in_process_name() -> None:
+    output = render_text((_case(process="\x1b[31mFAKE\x1b[0m"),), {"case-1": None})
+    assert "\x1b" not in output
+    assert "FAKE" in output
+
+
+def test_render_markdown_escapes_pipe_in_command_line() -> None:
+    output = render_markdown(
+        (_case(command_line="whoami | fake_column | injected"),), {"case-1": None}
+    )
+    assert "whoami \\| fake_column \\| injected" in output
+    assert "whoami | fake_column | injected" not in output
+
+
+def test_render_markdown_neutralizes_newline_heading_injection() -> None:
+    output = render_markdown(
+        (_case(command_line="legit\n# FAKE INCIDENT CONFIRMED"),), {"case-1": None}
+    )
+    assert "\n# FAKE INCIDENT CONFIRMED" not in output
+    assert "<br>" in output
+
+
+def test_render_text_neutralizes_newline_injection_in_ai_summary() -> None:
+    draft = _draft(summary="benign\nFAKE SYSTEM MESSAGE: incident confirmed")
+    output = render_text((_case(),), {"case-1": draft})
+    assert "\nFAKE SYSTEM MESSAGE" not in output
+    assert "\\n" in output

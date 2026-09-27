@@ -1,14 +1,17 @@
 """Tests for src/triageai/normalization.py.
 
 Covers: canonicalization determinism, raw-vs-redacted ID derivation,
-timestamp parsing/UTC conversion, and missing/wrong-typed field
-handling in normalize_event.
+timestamp parsing/UTC conversion, missing/wrong-typed field handling
+in normalize_event, and (this fix) rejection of NFC key collisions.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
+from triageai.errors import TriageInputError
 from triageai.normalization import (
     canonicalize,
     derive_record_id,
@@ -30,15 +33,12 @@ def test_canonicalize_preserves_array_order() -> None:
 
 
 def test_canonicalize_nfc_normalizes_unicode_equivalents() -> None:
-    # "é" as a single codepoint vs. "e" + combining acute accent.
     composed = canonicalize({"user": "caf\u00e9"})
     decomposed = canonicalize({"user": "cafe\u0301"})
     assert composed == decomposed
 
 
 def test_derive_record_id_differs_for_different_secrets() -> None:
-    # Per the locked spec: two records differing only in a value that
-    # would later be redacted identically must still get different IDs.
     record_a = {"user": "alice", "command_line": "connect --token abc123"}
     record_b = {"user": "alice", "command_line": "connect --token xyz789"}
 
@@ -74,7 +74,7 @@ def test_normalize_event_preserves_supplied_record_id() -> None:
 
 def test_normalize_event_derives_id_when_absent() -> None:
     event = normalize_event({"host": "H1", "user": "alice"})
-    assert len(event.original_record_id) == 64  # SHA-256 hex digest length
+    assert len(event.original_record_id) == 64
 
 
 def test_normalize_event_missing_field_becomes_none_not_invented() -> None:
@@ -84,7 +84,6 @@ def test_normalize_event_missing_field_becomes_none_not_invented() -> None:
 
 
 def test_normalize_event_wrong_typed_field_becomes_none() -> None:
-    # host given as a number, not a string -- must not be coerced/invented.
     event = normalize_event({"host": 12345})
     assert event.host is None
 
@@ -102,3 +101,28 @@ def test_normalize_event_extracts_mitre_techniques() -> None:
 def test_normalize_event_mitre_techniques_defaults_to_empty() -> None:
     event = normalize_event({"host": "H1"})
     assert event.mitre_techniques == ()
+
+
+# --- This fix: NFC key-collision detection ---
+
+
+def test_canonicalize_rejects_keys_that_collide_after_nfc_normalization() -> None:
+    # "café" as a single composed codepoint vs. "cafe" + a combining
+    # acute accent -- two DIFFERENT raw JSON keys that become
+    # IDENTICAL after NFC normalization. Silently keeping one and
+    # discarding the other's value would be a real evidence-integrity
+    # violation.
+    record = {"caf\u00e9": "value_one", "cafe\u0301": "value_two"}
+    with pytest.raises(TriageInputError, match="normalize to the same"):
+        canonicalize(record)
+
+
+def test_derive_record_id_surfaces_key_collision_as_triage_input_error() -> None:
+    record = {"caf\u00e9": "a", "cafe\u0301": "b"}
+    with pytest.raises(TriageInputError):
+        derive_record_id(record)
+
+
+def test_canonicalize_non_colliding_keys_still_succeed() -> None:
+    result = canonicalize({"host": "H1", "user": "alice"})
+    assert isinstance(result, bytes)

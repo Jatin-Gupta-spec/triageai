@@ -1,8 +1,9 @@
 """Tests for src/triageai/readers/wazuh_json.py.
 
-Stage 4 only proves safe reading -- size limits, encoding rules,
+Stage 4 proves safe reading -- size limits, encoding rules,
 duplicate-key rejection, empty-input handling, and the per-analysis
-record cap. No event validation or rule evaluation happens here.
+record cap. This fix adds rejection of non-finite JSON numeric
+constants (NaN/Infinity/-Infinity).
 """
 
 from __future__ import annotations
@@ -127,4 +128,31 @@ def test_record_cap_exceeded_is_rejected(tmp_path: Path) -> None:
     file_path.write_bytes(json.dumps([{"i": i} for i in range(10_001)]).encode("utf-8"))
 
     with pytest.raises(TriageInputError, match="10,000"):
+        read_input(file_path)
+
+
+# --- This fix: non-finite JSON constants ---
+
+
+def test_nan_constant_is_rejected(tmp_path: Path) -> None:
+    file_path = tmp_path / "nan.json"
+    file_path.write_bytes(b'{"cpu_usage": NaN}')
+
+    with pytest.raises(TriageInputError, match="NaN"):
+        read_input(file_path)
+
+
+def test_infinity_constant_is_rejected(tmp_path: Path) -> None:
+    file_path = tmp_path / "inf.json"
+    file_path.write_bytes(b'{"value": Infinity}')
+
+    with pytest.raises(TriageInputError, match="Infinity"):
+        read_input(file_path)
+
+
+def test_negative_infinity_constant_is_rejected(tmp_path: Path) -> None:
+    file_path = tmp_path / "neg_inf.json"
+    file_path.write_bytes(b'{"value": -Infinity}')
+
+    with pytest.raises(TriageInputError, match="Infinity"):
         read_input(file_path)

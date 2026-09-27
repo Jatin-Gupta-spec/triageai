@@ -5,33 +5,42 @@ produces REDACTED COPIES for rendering, per the locked spec (Sections
 5, 8, 11). See models.py's module docstring for why real values are
 kept internally in the first place.
 
-Two distinct redaction behaviors, not to be confused with each other:
+Three distinct redaction behaviors, not to be confused with each other:
 
 1. Free-text redaction (command lines, arbitrary strings): every
    email-like substring becomes a flat, unnumbered "[REDACTED_EMAIL]"
-   token. Known secret patterns similarly become flat tokens.
+   token. Known secret PATTERNS (a "password=" or "Authorization:
+   Bearer ..." appearing INSIDE a string's own text) similarly become
+   flat tokens.
 
-2. Identity-field redaction (structured fields, AND rule-match
-   descriptions derived from those same fields, AND -- as of Stage 15
-   -- any secret pattern embedded in a rule-match description, e.g. a
-   decoded PowerShell payload that happens to contain a password):
-   each distinct email-like value gets its own numbered alias, and
-   every secret pattern gets the same flat token treatment as
-   free-text redaction gets. This is what lets two different accounts
-   stay distinguishable while still guaranteeing NO secret pattern
-   survives into a rendered report, regardless of which path (event
-   field or rule-match description) it arrived through.
+2. Identity-field redaction (structured fields, rule-match
+   descriptions, and -- as of this fix -- observed_facts and
+   evidence_gaps too): each distinct email-like value gets its own
+   numbered alias. This is what lets two different accounts stay
+   distinguishable in a rendered report, and lets the SAME identity be
+   recognized consistently wherever it appears.
+
+3. Key-aware secret redaction (this fix): redact_structure(), used for
+   arbitrary nested evidence structures, now inspects the KEY name
+   during traversal, not just the string VALUE. Behavior #1 above only
+   catches a secret when "key: value" text appears literally INSIDE
+   one string -- it never caught a genuine JSON field like
+   {"password": "hunter2"}, because the value "hunter2" alone matches
+   no pattern. Any key whose name (case-insensitively, ignoring
+   separators) contains password, passwd, pwd, token, authorization,
+   cookie, secret, or private key now has its ENTIRE value replaced
+   with "[REDACTED_SECRET]", regardless of that value's own shape.
 
 Documented, deliberate consequence, unchanged since Stage 11: the SAME
 email address renders differently depending on which REDACTION
-CATEGORY touched it -- flat if it appeared in genuinely free text (a
-command line), numbered if it appeared as a structured identity field
-or in a rule description.
+CATEGORY touched it -- flat if it appeared in genuinely free text,
+numbered if it appeared as a structured identity field, rule
+description, observed fact, or evidence gap.
 
 Scope decision, unchanged since Stage 6: identity fields that do NOT
 look like an email (a plain "alice", not "alice@corp.local") are NOT
-redacted by this module -- a real product decision this project
-hasn't made yet, not an oversight.
+aliased by this module -- a real product decision this project hasn't
+made yet, not an oversight.
 """
 
 from __future__ import annotations
@@ -57,12 +66,39 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
 )
 
+# Key names (not string content) that mark an entire value as
+# sensitive, regardless of that value's own shape. Deliberately narrow
+# -- matches the audit's own enumerated list plus the obvious
+# abbreviations of the same words (passwd/pwd), not an invented,
+# broader guess. Separators and case are normalized away first, so
+# "Private-Key", "private_key", and "PRIVATE KEY" all match the same
+# way.
+_SENSITIVE_KEY_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "authorization",
+    "cookie",
+    "secret",
+    "privatekey",
+)
+_SENSITIVE_VALUE_TOKEN = "[REDACTED_SECRET]"
+_SEPARATOR_PATTERN = re.compile(r"[^a-z0-9]")
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalized = _SEPARATOR_PATTERN.sub("", key.lower())
+    return any(substring in normalized for substring in _SENSITIVE_KEY_SUBSTRINGS)
+
 
 def redact_free_text(text: str) -> str:
     """Replace email-like substrings and known secret patterns in free text.
 
     Every match becomes a flat, unnumbered token -- this function has
-    no notion of "distinct values," unlike EmailAliaser below.
+    no notion of "distinct values," unlike EmailAliaser below, and (by
+    design) has no notion of a surrounding key name either -- see
+    redact_structure for key-aware redaction of a nested structure.
     """
     redacted = EMAIL_PATTERN.sub("[REDACTED_EMAIL]", text)
     for pattern, replacement in _SECRET_PATTERNS:
@@ -71,11 +107,26 @@ def redact_free_text(text: str) -> str:
 
 
 def redact_structure(value: Any) -> Any:
-    """Recursively apply redact_free_text to every string in a nested structure."""
+    """Recursively redact a nested structure (dicts, lists, strings).
+
+    Two mechanisms, applied together: any dict VALUE whose KEY name is
+    sensitive (see _is_sensitive_key) is replaced wholesale with
+    "[REDACTED_SECRET]", regardless of that value's own type or shape
+    -- a nested dict or list sitting under a sensitive key is not
+    descended into; the whole thing is secret. Every other string, at
+    any depth, still gets redact_free_text's pattern-based redaction.
+    """
     if isinstance(value, str):
         return redact_free_text(value)
     if isinstance(value, dict):
-        return {key: redact_structure(item) for key, item in value.items()}
+        return {
+            key: (
+                _SENSITIVE_VALUE_TOKEN
+                if isinstance(key, str) and _is_sensitive_key(key)
+                else redact_structure(item)
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [redact_structure(item) for item in value]
     return value
@@ -85,10 +136,8 @@ class EmailAliaser:
     """Assigns stable, numbered aliases to email-like identity values.
 
     Build ONE instance per case/report and reuse it across every
-    event AND rule match being rendered together, so the same account
-    always gets the same alias -- this is what proves UPN-format users
-    stay distinguishable, and stay CONSISTENT across every place they
-    appear, in a rendered report.
+    event, rule match, observed fact, and evidence gap being rendered
+    together, so the same account always gets the same alias.
     """
 
     def __init__(self, values: Iterable[str]) -> None:
@@ -109,19 +158,10 @@ class EmailAliaser:
 
 
 def redact_text_with_aliases(text: str, aliaser: EmailAliaser) -> str:
-    """Full redaction for text embedded in a rule-match description or
-    similar rendered-but-derived text: secret patterns are scrubbed to
-    flat tokens FIRST (same as redact_free_text), THEN any remaining
-    email-like substring is replaced with its STABLE, numbered alias
-    -- unlike redact_free_text's flat, unnumbered email token, this
-    keeps one identity mapped to one alias everywhere it appears in a
-    rendered case.
-
-    Stage 15 fix: previously only did email aliasing, silently
-    skipping secret-pattern scrubbing -- meaning a decoded PowerShell
-    payload embedded in a rule description containing a real password
-    or token would have rendered unredacted. Closed by running the
-    same _SECRET_PATTERNS pass redact_free_text uses, before aliasing.
+    """Full redaction for text embedded in a rule-match description,
+    observed fact, or evidence gap: secret patterns are scrubbed to
+    flat tokens FIRST, THEN any remaining email-like substring is
+    replaced with its STABLE, numbered alias.
     """
     redacted = text
     for pattern, replacement in _SECRET_PATTERNS:
@@ -146,12 +186,7 @@ def redact_event_for_render(event: NormalizedEvent, aliaser: EmailAliaser) -> No
 
 
 def redact_rule_match_for_render(match: RuleMatch, aliaser: EmailAliaser) -> RuleMatch:
-    """Produce a REDACTED COPY of one RuleMatch, safe for a report or prompt.
-
-    Known, documented, accepted limitation, unchanged: a PLAIN
-    (non-email-shaped) identity in `description` -- e.g. a bare
-    hostname like "WIN-CLIENT01" -- is NOT redacted here.
-    """
+    """Produce a REDACTED COPY of one RuleMatch, safe for a report or prompt."""
     return replace(match, description=redact_text_with_aliases(match.description, aliaser))
 
 
@@ -159,7 +194,8 @@ def _collect_identity_seed_values(case: Case) -> list[str]:
     """Every value that must be in the aliaser's dictionary BEFORE
     alias_for() is called on it anywhere -- structured identity fields
     from every event, plus any email-like substring already sitting in
-    a rule-match description.
+    a rule-match description, observed fact, or evidence gap (the
+    latter two were previously never scanned at all).
     """
     values: list[str] = []
     for event in case.normalized_events:
@@ -168,16 +204,23 @@ def _collect_identity_seed_values(case: Case) -> list[str]:
                 values.append(field)
     for match in case.rule_matches:
         values.extend(EMAIL_PATTERN.findall(match.description))
+    for fact in case.observed_facts:
+        values.extend(EMAIL_PATTERN.findall(fact))
+    for gap in case.evidence_gaps:
+        values.extend(EMAIL_PATTERN.findall(gap))
     return values
 
 
 def redact_case_for_render(case: Case) -> Case:
     """Produce a REDACTED COPY of a case, safe to render in a report or prompt.
 
-    One EmailAliaser, seeded from every identity-bearing value in this
-    case (events AND rule matches), is reused across the whole
-    rendering -- guaranteeing one identity maps to one alias
-    everywhere it appears. The original `case` is never mutated.
+    Fix: observed_facts and evidence_gaps are now included in the
+    redaction pass -- previously only normalized_events, rule_matches,
+    affected_users, and affected_hosts were redacted, leaving a real
+    identity embedded in an observed-fact sentence (e.g. "1 event(s)
+    observed for host alice@corp.local") exposed unredacted in every
+    rendered report, even though the structured host field right next
+    to it WAS correctly aliased. The original `case` is never mutated.
     """
     aliaser = EmailAliaser(_collect_identity_seed_values(case))
 
@@ -189,6 +232,12 @@ def redact_case_for_render(case: Case) -> Case:
     )
     redacted_users = tuple(aliaser.alias_for(user) for user in case.affected_users)
     redacted_hosts = tuple(aliaser.alias_for(host) for host in case.affected_hosts)
+    redacted_observed_facts = tuple(
+        redact_text_with_aliases(fact, aliaser) for fact in case.observed_facts
+    )
+    redacted_evidence_gaps = tuple(
+        redact_text_with_aliases(gap, aliaser) for gap in case.evidence_gaps
+    )
 
     return replace(
         case,
@@ -196,4 +245,6 @@ def redact_case_for_render(case: Case) -> Case:
         rule_matches=redacted_matches,
         affected_users=redacted_users,
         affected_hosts=redacted_hosts,
+        observed_facts=redacted_observed_facts,
+        evidence_gaps=redacted_evidence_gaps,
     )

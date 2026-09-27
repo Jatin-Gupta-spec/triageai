@@ -3,9 +3,10 @@
 Covers: flat free-text redaction, recursive structure redaction,
 numbered identity-field aliasing, proof that redaction never mutates
 original evidence, that a rule-match description gets the SAME alias
-as the same identity's structured field, and (Stage 15) that a
-rule-match description gets FULL secret-pattern scrubbing, not just
-email aliasing.
+as the same identity's structured field, that rule descriptions get
+full secret-pattern scrubbing, key-aware secret redaction in
+redact_structure, and (this fix) that observed_facts/evidence_gaps are
+now covered by the same identity redaction as everything else.
 """
 
 from __future__ import annotations
@@ -223,8 +224,6 @@ def test_redact_case_for_render_uses_same_alias_in_event_and_rule_match() -> Non
 
 
 def test_redact_rule_match_scrubs_secret_pattern_in_description() -> None:
-    # Stage 15 fix: proves a decoded-payload secret embedded in a rule
-    # description (not just an email) is actually scrubbed now.
     match = RuleMatch(
         rule_id="PS-001",
         mitre_technique="T1059.001",
@@ -236,3 +235,78 @@ def test_redact_rule_match_scrubs_secret_pattern_in_description() -> None:
     redacted = redact_rule_match_for_render(match, EmailAliaser([]))
     assert "Sup3rSecret" not in redacted.description
     assert "[REDACTED_SECRET]" in redacted.description
+
+
+# --- This fix: key-aware secret redaction in redact_structure ---
+
+
+def test_redact_structure_redacts_value_by_sensitive_key_password() -> None:
+    data = {"password": "hunter2"}
+    assert redact_structure(data) == {"password": "[REDACTED_SECRET]"}
+
+
+def test_redact_structure_redacts_nested_dict_and_array_by_key() -> None:
+    data = {"password": "hunter2", "nested": [{"token": "abc"}]}
+    result = redact_structure(data)
+    assert result == {"password": "[REDACTED_SECRET]", "nested": [{"token": "[REDACTED_SECRET]"}]}
+
+
+def test_redact_structure_sensitive_key_matches_regardless_of_case_and_separators() -> None:
+    data = {"Private-Key": "-----BEGIN...", "AUTHORIZATION": "Bearer xyz", "Secret_Key": "s3cr3t"}
+    result = redact_structure(data)
+    assert result["Private-Key"] == "[REDACTED_SECRET]"
+    assert result["AUTHORIZATION"] == "[REDACTED_SECRET]"
+    assert result["Secret_Key"] == "[REDACTED_SECRET]"
+
+
+def test_redact_structure_non_sensitive_key_still_gets_pattern_based_redaction() -> None:
+    data = {"note": "contact alice@corp.local"}
+    result = redact_structure(data)
+    assert result == {"note": "contact [REDACTED_EMAIL]"}
+
+
+def test_redact_structure_sensitive_key_wholesale_replaces_non_string_value() -> None:
+    data = {"cookie": ["session=abc123", {"csrf": "xyz"}]}
+    assert redact_structure(data) == {"cookie": "[REDACTED_SECRET]"}
+
+
+# --- This fix: observed_facts / evidence_gaps redaction ---
+
+
+def test_redact_case_for_render_redacts_email_in_observed_facts() -> None:
+    event = _event("rec-1", user=None)
+    case = Case(
+        case_id="case-1",
+        first_seen=None,
+        last_seen=None,
+        affected_hosts=("WIN-CLIENT01",),
+        affected_users=(),
+        normalized_events=(event,),
+        rule_matches=(),
+        severity=Severity.INFORMATIONAL,
+        confidence=Confidence.LOW,
+        observed_facts=("1 event(s) observed for host alice@corp.local",),
+        evidence_gaps=(),
+    )
+    redacted_case = redact_case_for_render(case)
+    assert "alice@corp.local" not in redacted_case.observed_facts[0]
+    assert case.observed_facts[0] == "1 event(s) observed for host alice@corp.local"
+
+
+def test_redact_case_for_render_redacts_email_in_evidence_gaps() -> None:
+    event = _event("rec-1", user=None)
+    case = Case(
+        case_id="case-1",
+        first_seen=None,
+        last_seen=None,
+        affected_hosts=(),
+        affected_users=(),
+        normalized_events=(event,),
+        rule_matches=(),
+        severity=Severity.INFORMATIONAL,
+        confidence=Confidence.LOW,
+        observed_facts=(),
+        evidence_gaps=("gap concerning bob@corp.local's account",),
+    )
+    redacted_case = redact_case_for_render(case)
+    assert "bob@corp.local" not in redacted_case.evidence_gaps[0]

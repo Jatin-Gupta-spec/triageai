@@ -9,12 +9,13 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from triageai.correlation import build_cases
 from triageai.errors import TriageInputError
 from triageai.hallucination_check import HallucinationError, check_for_hallucination
-from triageai.models import AIAnalysisDraft, Case, NormalizedEvent
+from triageai.models import AIAnalysisDraft, Case, NormalizedEvent, ScanSummary
 from triageai.normalization import normalize_event
 from triageai.output_validation import OutputValidationError, validate_ai_output
 from triageai.prompt_builder import build_prompt
@@ -44,25 +45,56 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _normalize_records(raw_records: tuple[RawRecord, ...]) -> tuple[NormalizedEvent, ...]:
-    """Validate each raw record is a JSON object, then normalize it."""
+@dataclass(frozen=True, slots=True)
+class _NormalizationResult:
+    """Result of validating, normalizing, and deduplicating raw records."""
+
+    events: tuple[NormalizedEvent, ...]
+    total_records_read: int
+    duplicate_count: int
+
+
+def _normalize_records(raw_records: tuple[RawRecord, ...]) -> _NormalizationResult:
+    """Validate each raw record is a JSON object, normalize it, and
+    deduplicate by original_record_id.
+
+    Fix: the locked spec (Section 5, present since the very first
+    version of this project's spec) requires "Deduplicate by
+    original_record_id and report the duplicate count" -- this was
+    never actually implemented until now, across all 15 build stages.
+    The FIRST occurrence of a given ID, in the deterministic
+    file/record order read_input already produces, is kept; every
+    LATER occurrence of the same ID is counted as a duplicate and
+    dropped, never double-processed by correlation or the rules.
+    """
+    seen_ids: set[str] = set()
     events: list[NormalizedEvent] = []
+    duplicate_count = 0
+
     for record in raw_records:
         if not isinstance(record.data, dict):
             raise TriageInputError(
                 f"{record.source_path}: record is not a JSON object "
                 f"(got {type(record.data).__name__})"
             )
-        events.append(normalize_event(record.data))
-    return tuple(events)
+        event = normalize_event(record.data)
+        if event.original_record_id in seen_ids:
+            duplicate_count += 1
+            continue
+        seen_ids.add(event.original_record_id)
+        events.append(event)
+
+    return _NormalizationResult(
+        events=tuple(events),
+        total_records_read=len(raw_records),
+        duplicate_count=duplicate_count,
+    )
 
 
 def _generate_validated_draft(redacted_case: Case) -> AIAnalysisDraft | None:
     """Run the full mock-AI pipeline for one case: generate, validate
     shape, validate content. Returns None if EITHER validation layer
-    rejects the draft -- per the locked spec's fail-closed rule, there
-    is no partial AI content ever rendered. The caller is responsible
-    for still rendering the deterministic report regardless.
+    rejects the draft -- per the locked spec's fail-closed rule.
     """
     provider = MockProvider()
     raw_text = provider.generate(redacted_case)
@@ -80,12 +112,22 @@ def _generate_validated_draft(redacted_case: Case) -> AIAnalysisDraft | None:
     return draft
 
 
+def _format_scan_summary(summary: ScanSummary) -> str:
+    return (
+        f"Scan summary: {summary.total_records_read} record(s) read, "
+        f"{summary.duplicate_count} duplicate(s) skipped, "
+        f"{summary.undated_count} undated, "
+        f"{len(summary.cases)} case(s)."
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the TriageAI CLI.
 
     Returns:
         0 on success (including valid, empty input), 2 for any
-        input-reading or record-validation error, 3 for a usage error.
+        input-reading, record-validation, or normalization error, 3
+        for a usage error.
     """
     args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
@@ -101,26 +143,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         result = read_input(Path(parsed.path))
-        events = _normalize_records(result.raw_records)
+        normalization = _normalize_records(result.raw_records)
     except TriageInputError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    cases = build_cases(events)
+    cases = build_cases(normalization.events)
     redacted_cases = tuple(redact_case_for_render(case) for case in cases)
 
-    # AI drafts are generated from the prompt (proving the full
-    # pipeline runs end to end, including prompt construction) but
-    # the draft itself -- not the prompt text -- is what gets
-    # rendered. The prompt is what a real provider would receive;
-    # the mock ignores it and works from redacted_case directly,
-    # which is why build_prompt's result is unused here beyond
-    # exercising it. See prompt_builder.py.
+    undated_count = sum(1 for event in normalization.events if event.timestamp is None)
+    scan_summary = ScanSummary(
+        total_records_read=normalization.total_records_read,
+        duplicate_count=normalization.duplicate_count,
+        undated_count=undated_count,
+        cases=cases,
+    )
+
     ai_drafts: dict[str, AIAnalysisDraft | None] = {}
     for case in redacted_cases:
-        build_prompt(case)  # exercises the full pipeline; see note above
+        build_prompt(case)  # exercises the full pipeline; see prompt_builder.py
         ai_drafts[case.case_id] = _generate_validated_draft(case)
 
+    print(_format_scan_summary(scan_summary))
     if parsed.format == "markdown":
         print(render_markdown(redacted_cases, ai_drafts))
     else:

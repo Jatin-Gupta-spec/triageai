@@ -1,9 +1,9 @@
 """Tests for the CLI entry point.
 
-Stage 14 wires the full mock-AI pipeline (generate -> validate shape
--> validate against evidence) into main(). Every existing behavior
-(exit codes, input handling) is unchanged; the report content now also
-includes an AI draft or an explicit rejection notice per case.
+Wires normalization, redaction, correlation, and the mock-AI pipeline
+together. This fix adds deduplication by original_record_id and a
+printed scan summary (records read / duplicates skipped / undated /
+cases) -- both previously spec'd (Section 5) but never implemented.
 """
 
 from __future__ import annotations
@@ -146,8 +146,83 @@ def test_analyze_shows_rule_match_and_ai_observation_for_auth001(
     assert exit_code == 0
     assert "AUTH-001" in captured.out
     assert "MEDIUM" in captured.out
-    # Stage 15 regression guard: a real rule match must NOT cause the
-    # AI draft to be rejected -- this is exactly the bug found by
-    # running the real fixtures by hand.
     assert "REJECTED" not in captured.out
     assert "AI-generated draft requiring human review" in captured.out
+
+
+# --- This fix: deduplication and scan summary ---
+
+
+def test_analyze_deduplicates_supplied_ids(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    records = [
+        {"original_record_id": "dup-1", "host": "H1", "event_id": "4624"},
+        {"original_record_id": "dup-1", "host": "H1", "event_id": "4624"},
+    ]
+    file_path = tmp_path / "dups.json"
+    file_path.write_text(json.dumps(records), encoding="utf-8")
+
+    exit_code = main(["analyze", str(file_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Scan summary: 2 record(s) read, 1 duplicate(s) skipped" in captured.out
+
+
+def test_analyze_deduplicates_derived_ids_for_identical_records(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # No original_record_id supplied on either -- both derive the SAME
+    # SHA-256 ID because their raw content is byte-for-byte identical.
+    records = [{"host": "H1", "event_id": "4624"}, {"host": "H1", "event_id": "4624"}]
+    file_path = tmp_path / "derived_dups.json"
+    file_path.write_text(json.dumps(records), encoding="utf-8")
+
+    exit_code = main(["analyze", str(file_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "1 duplicate(s) skipped" in captured.out
+
+
+def test_analyze_deduplicates_across_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "a.json").write_text(
+        json.dumps({"original_record_id": "shared-id", "host": "H1"}), encoding="utf-8"
+    )
+    (tmp_path / "b.json").write_text(
+        json.dumps({"original_record_id": "shared-id", "host": "H1"}), encoding="utf-8"
+    )
+
+    exit_code = main(["analyze", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "1 duplicate(s) skipped" in captured.out
+
+
+def test_analyze_no_duplicates_reports_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    file_path = tmp_path / "one.json"
+    file_path.write_text(json.dumps({"host": "H1"}), encoding="utf-8")
+
+    exit_code = main(["analyze", str(file_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "0 duplicate(s) skipped" in captured.out
+
+
+def test_analyze_scan_summary_line_present(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    file_path = tmp_path / "one.json"
+    file_path.write_text(json.dumps({"host": "H1"}), encoding="utf-8")
+
+    main(["analyze", str(file_path)])
+    captured = capsys.readouterr()
+
+    assert captured.out.startswith("Scan summary:")
