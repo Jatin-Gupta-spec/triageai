@@ -11,14 +11,14 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from triageai.correlation import build_cases
 from triageai.errors import TriageInputError
-from triageai.models import Case, Confidence, NormalizedEvent, Severity
+from triageai.models import NormalizedEvent
 from triageai.normalization import normalize_event
 from triageai.readers.wazuh_json import RawRecord, read_input
 from triageai.redaction import redact_case_for_render
 from triageai.reporters.markdown_report import render_markdown
 from triageai.reporters.terminal import render_text
-from triageai.reporters.timeline import build_timeline
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -41,14 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _normalize_records(raw_records: tuple[RawRecord, ...]) -> tuple[NormalizedEvent, ...]:
-    """Validate each raw record is a JSON object, then normalize it.
-
-    A JSON array element that is not itself an object (e.g. a bare
-    number or string) is not a valid Wazuh-style record -- per the
-    locked spec's evidence-integrity principle, TriageAI must not
-    silently skip or invent structure for it. It is treated the same
-    as any other malformed input: a TriageInputError, exit code 2.
-    """
+    """Validate each raw record is a JSON object, then normalize it."""
     events: list[NormalizedEvent] = []
     for record in raw_records:
         if not isinstance(record.data, dict):
@@ -58,32 +51,6 @@ def _normalize_records(raw_records: tuple[RawRecord, ...]) -> tuple[NormalizedEv
             )
         events.append(normalize_event(record.data))
     return tuple(events)
-
-
-def _build_case_for_display(events: tuple[NormalizedEvent, ...], case_id: str) -> Case:
-    # Stage 7 only: a single, unscored placeholder Case wrapping every
-    # event read this run, purely so redact_case_for_render (which
-    # operates on Case, not a bare event list) has something to take.
-    # Real correlation into multiple, properly-scored cases arrives in
-    # Stage 11 -- this function is deliberately temporary and will be
-    # replaced outright, not extended, when that stage lands.
-    users = tuple(sorted({e.user for e in events if e.user is not None}))
-    hosts = tuple(sorted({e.host for e in events if e.host is not None}))
-    dated_timestamps = sorted(e.timestamp for e in events if e.timestamp is not None)
-
-    return Case(
-        case_id=case_id,
-        first_seen=dated_timestamps[0] if dated_timestamps else None,
-        last_seen=dated_timestamps[-1] if dated_timestamps else None,
-        affected_hosts=hosts,
-        affected_users=users,
-        normalized_events=events,
-        rule_matches=(),
-        severity=Severity.INFORMATIONAL,
-        confidence=Confidence.LOW,
-        observed_facts=(),
-        evidence_gaps=(),
-    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -112,13 +79,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    case = _build_case_for_display(events, case_id="stage7-placeholder")
-    redacted_case = redact_case_for_render(case)
-    ordered_events = build_timeline(redacted_case.normalized_events)
+    cases = build_cases(events)
+    redacted_cases = tuple(redact_case_for_render(case) for case in cases)
 
     if parsed.format == "markdown":
-        print(render_markdown(ordered_events))
+        print(render_markdown(redacted_cases))
     else:
-        print(render_text(ordered_events))
+        print(render_text(redacted_cases))
 
     return 0

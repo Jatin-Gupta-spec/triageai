@@ -1,24 +1,54 @@
 """Plain-text report rendering. Renders REDACTED copies only -- callers
-are responsible for passing already-redacted events/cases (see
-redaction.py); this module does not redact anything itself.
+are responsible for passing already-redacted cases (see redaction.py).
 """
 
 from __future__ import annotations
 
-from triageai.models import NormalizedEvent
+from triageai.models import Case
+from triageai.reporters.timeline import build_timeline
 
 
-def render_text(events: tuple[NormalizedEvent, ...]) -> str:
-    """Render a plain-text timeline. Caller must pass redacted events."""
-    if not events:
+def render_text(cases: tuple[Case, ...]) -> str:
+    """Render one section per case: severity/confidence, rule matches,
+    evidence gaps, observed facts, then a sorted event timeline.
+    """
+    if not cases:
         return "No events to report."
 
-    lines: list[str] = []
-    for event in events:
-        when = event.timestamp.isoformat() if event.timestamp is not None else "UNDATED"
-        lines.append(
-            f"[{when}] host={event.host or '?'} user={event.user or '?'} "
-            f"event_id={event.event_id or '?'} process={event.process or '?'} "
-            f"command_line={event.command_line or '?'}"
-        )
-    return "\n".join(lines)
+    sections: list[str] = []
+    for case in cases:
+        lines = [
+            f"=== Case {case.case_id} ===",
+            f"Severity: {case.severity.name} | Confidence: {case.confidence.name}",
+            f"Hosts: {', '.join(case.affected_hosts) or '?'}",
+            f"Users: {', '.join(case.affected_users) or '?'}",
+        ]
+
+        if case.rule_matches:
+            lines.append("Rule matches:")
+            lines.extend(
+                f"  - {m.rule_id} ({m.mitre_technique}): {m.description}" for m in case.rule_matches
+            )
+        else:
+            lines.append("Rule matches: none")
+
+        if case.evidence_gaps:
+            lines.append("Evidence gaps:")
+            lines.extend(f"  - {gap}" for gap in case.evidence_gaps)
+
+        if case.observed_facts:
+            lines.append("Observed facts:")
+            lines.extend(f"  - {fact}" for fact in case.observed_facts)
+
+        lines.append("Timeline:")
+        for event in build_timeline(case.normalized_events):
+            when = event.timestamp.isoformat() if event.timestamp is not None else "UNDATED"
+            lines.append(
+                f"  [{when}] host={event.host or '?'} user={event.user or '?'} "
+                f"event_id={event.event_id or '?'} process={event.process or '?'} "
+                f"command_line={event.command_line or '?'}"
+            )
+
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)

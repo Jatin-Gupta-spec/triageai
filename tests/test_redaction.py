@@ -1,21 +1,24 @@
 """Tests for src/triageai/redaction.py.
 
 Covers: flat free-text redaction, recursive structure redaction,
-numbered identity-field aliasing, and proof that redaction never
-mutates the original NormalizedEvent/Case.
+numbered identity-field aliasing, proof that redaction never mutates
+original evidence, and (Stage 11) that a rule-match description gets
+the SAME alias as the same identity's structured field.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from triageai.models import Case, Confidence, NormalizedEvent, Severity
+from triageai.models import Case, Confidence, NormalizedEvent, RuleMatch, Severity
 from triageai.redaction import (
     EmailAliaser,
     redact_case_for_render,
     redact_event_for_render,
     redact_free_text,
+    redact_rule_match_for_render,
     redact_structure,
+    redact_text_with_aliases,
 )
 
 
@@ -77,8 +80,7 @@ def test_redact_free_text_leaves_plain_text_unchanged() -> None:
 
 def test_redact_structure_walks_nested_dict() -> None:
     data = {"outer": {"inner": "reach me at bob@corp.local"}}
-    result = redact_structure(data)
-    assert result == {"outer": {"inner": "reach me at [REDACTED_EMAIL]"}}
+    assert redact_structure(data) == {"outer": {"inner": "reach me at [REDACTED_EMAIL]"}}
 
 
 def test_redact_structure_walks_nested_list() -> None:
@@ -98,9 +100,7 @@ def test_redact_structure_leaves_non_string_values_unchanged() -> None:
 
 def test_aliaser_assigns_distinct_aliases_to_distinct_values() -> None:
     aliaser = EmailAliaser(["bob@corp.local", "alice@corp.local"])
-    alice_alias = aliaser.alias_for("alice@corp.local")
-    bob_alias = aliaser.alias_for("bob@corp.local")
-    assert alice_alias != bob_alias
+    assert aliaser.alias_for("alice@corp.local") != aliaser.alias_for("bob@corp.local")
 
 
 def test_aliaser_same_value_gets_same_alias() -> None:
@@ -109,8 +109,6 @@ def test_aliaser_same_value_gets_same_alias() -> None:
 
 
 def test_aliaser_orders_by_sorted_case_folded_value() -> None:
-    # "alice" sorts before "bob" -- alias numbering must be deterministic,
-    # not dependent on insertion order.
     aliaser = EmailAliaser(["Bob@Corp.local", "alice@corp.local"])
     assert aliaser.alias_for("alice@corp.local") == "[REDACTED_EMAIL_001]"
     assert aliaser.alias_for("Bob@Corp.local") == "[REDACTED_EMAIL_002]"
@@ -126,19 +124,13 @@ def test_aliaser_leaves_non_email_value_unchanged() -> None:
 
 def test_redact_event_for_render_does_not_mutate_original() -> None:
     event = _event("rec-1", user="alice@corp.local")
-    aliaser = EmailAliaser(["alice@corp.local"])
-
-    redact_event_for_render(event, aliaser)
-
-    assert event.user == "alice@corp.local"  # original untouched
+    redact_event_for_render(event, EmailAliaser(["alice@corp.local"]))
+    assert event.user == "alice@corp.local"
 
 
 def test_redact_event_for_render_redacts_command_line_email() -> None:
     event = _event("rec-1", user="alice@corp.local", command_line="notify bob@corp.local")
-    aliaser = EmailAliaser(["alice@corp.local"])
-
-    redacted = redact_event_for_render(event, aliaser)
-
+    redacted = redact_event_for_render(event, EmailAliaser(["alice@corp.local"]))
     assert redacted.command_line == "notify [REDACTED_EMAIL]"
 
 
@@ -165,18 +157,9 @@ def test_redact_case_for_render_upn_users_get_distinct_aliases() -> None:
 
     redacted_case = redact_case_for_render(case)
 
-    # Internal, real case is untouched -- this is the property that
-    # keeps correlation (built in Stage 11) safe to run BEFORE render.
     assert case.affected_users == ("alice@corp.local", "bob@corp.local")
-
-    # Rendered copy: both users present, but as two DIFFERENT aliases --
-    # neither collapsed into the other, neither left as a real email.
     assert redacted_case.affected_users[0] != redacted_case.affected_users[1]
-    assert all(EMAIL_PATTERN_NOT_PRESENT(u) for u in redacted_case.affected_users)
-
-
-def EMAIL_PATTERN_NOT_PRESENT(value: str) -> bool:
-    return "@" not in value
+    assert all("@" not in u for u in redacted_case.affected_users)
 
 
 def test_redact_case_for_render_does_not_mutate_original_case() -> None:
@@ -199,3 +182,60 @@ def test_redact_case_for_render_does_not_mutate_original_case() -> None:
 
     assert case.normalized_events[0].user == "alice@corp.local"
     assert case.affected_users == ("alice@corp.local",)
+
+
+# --- Stage 11: closing the RuleMatch redaction gap ---
+
+
+def test_redact_text_with_aliases_uses_stable_numbered_alias() -> None:
+    aliaser = EmailAliaser(["alice@corp.local"])
+    result = redact_text_with_aliases("failures for alice@corp.local on host H1", aliaser)
+    assert result == "failures for [REDACTED_EMAIL_001] on host H1"
+
+
+def test_redact_rule_match_for_render_does_not_mutate_original() -> None:
+    match = RuleMatch(
+        rule_id="AUTH-001",
+        mitre_technique="T1110",
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
+        matched_event_ids=("rec-1",),
+        description="failures for alice@corp.local",
+    )
+    redact_rule_match_for_render(match, EmailAliaser(["alice@corp.local"]))
+    assert match.description == "failures for alice@corp.local"
+
+
+def test_redact_case_for_render_uses_same_alias_in_event_and_rule_match() -> None:
+    # This is the direct proof the Stage 9/10 gap is closed: the same
+    # identity gets the same alias whether it's a structured field or
+    # embedded in a rule-match description.
+    event = _event("rec-1", user="alice@corp.local")
+    match = RuleMatch(
+        rule_id="AUTH-001",
+        mitre_technique="T1110",
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
+        matched_event_ids=("rec-1",),
+        description="failures for user:alice@corp.local on host WIN-CLIENT01",
+    )
+    case = Case(
+        case_id="case-1",
+        first_seen=event.timestamp,
+        last_seen=event.timestamp,
+        affected_hosts=("WIN-CLIENT01",),
+        affected_users=("alice@corp.local",),
+        normalized_events=(event,),
+        rule_matches=(match,),
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
+        observed_facts=(),
+        evidence_gaps=(),
+    )
+
+    redacted_case = redact_case_for_render(case)
+
+    assert "alice@corp.local" not in redacted_case.rule_matches[0].description
+    user_alias = redacted_case.normalized_events[0].user
+    assert user_alias is not None
+    assert user_alias in redacted_case.rule_matches[0].description
