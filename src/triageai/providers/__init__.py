@@ -1,0 +1,1 @@
+"""AI providers for TriageAI. v0.1 ships a deterministic mock only."""
