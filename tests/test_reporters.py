@@ -1,16 +1,15 @@
 """Tests for terminal.py and markdown_report.py rendering.
 
-Stage 11 changes both renderers' signature from a bare event tuple to
-a tuple of Cases -- each case now carries its own severity,
-confidence, rule matches, observed facts, and evidence gaps, all of
-which the report must surface, not just the event timeline.
+Stage 14 changes both renderers' signature to also take an
+ai_drafts dict (case_id -> AIAnalysisDraft | None), rendering either
+the draft's content or an explicit rejection notice.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from triageai.models import Case, Confidence, NormalizedEvent, RuleMatch, Severity
+from triageai.models import AIAnalysisDraft, Case, Confidence, NormalizedEvent, RuleMatch, Severity
 from triageai.reporters.markdown_report import render_markdown
 from triageai.reporters.terminal import render_text
 
@@ -42,10 +41,11 @@ def _case(
     observed_facts: tuple[str, ...] = (),
     evidence_gaps: tuple[str, ...] = (),
     command_line: str | None = None,
+    case_id: str = "case-1",
 ) -> Case:
     event = _event(command_line=command_line)
     return Case(
-        case_id="case-1",
+        case_id=case_id,
         first_seen=event.timestamp,
         last_seen=event.timestamp,
         affected_hosts=("WIN-CLIENT01",),
@@ -59,24 +59,38 @@ def _case(
     )
 
 
+def _draft(summary: str = "test summary") -> AIAnalysisDraft:
+    return AIAnalysisDraft(
+        summary=summary,
+        observations=("an observation",),
+        investigation_questions=("a question?",),
+        evidence_gaps=(),
+        possible_false_positives=("a false positive",),
+        recommended_next_steps=("a next step",),
+        unsupported_claims=(),
+    )
+
+
 def test_render_text_empty_cases() -> None:
-    assert render_text(()) == "No events to report."
+    assert render_text((), {}) == "No events to report."
 
 
 def test_render_text_includes_key_fields() -> None:
-    output = render_text((_case(),))
+    output = render_text((_case(),), {"case-1": None})
     assert "WIN-CLIENT01" in output
     assert "alice" in output
     assert "4625" in output
 
 
 def test_render_text_includes_command_line() -> None:
-    output = render_text((_case(command_line="net user alice /active:yes"),))
+    output = render_text((_case(command_line="net user alice /active:yes"),), {"case-1": None})
     assert "net user alice /active:yes" in output
 
 
 def test_render_text_shows_severity_and_confidence() -> None:
-    output = render_text((_case(severity=Severity.HIGH, confidence=Confidence.MEDIUM),))
+    output = render_text(
+        (_case(severity=Severity.HIGH, confidence=Confidence.MEDIUM),), {"case-1": None}
+    )
     assert "HIGH" in output
     assert "MEDIUM" in output
 
@@ -90,14 +104,26 @@ def test_render_text_shows_rule_matches() -> None:
         matched_event_ids=("rec-1",),
         description="5 failures in 10 minutes",
     )
-    output = render_text((_case(rule_matches=(match,)),))
+    output = render_text((_case(rule_matches=(match,)),), {"case-1": None})
     assert "AUTH-001" in output
     assert "5 failures in 10 minutes" in output
 
 
 def test_render_text_shows_evidence_gaps() -> None:
-    output = render_text((_case(evidence_gaps=("1 event has no timestamp",)),))
+    output = render_text((_case(evidence_gaps=("1 event has no timestamp",)),), {"case-1": None})
     assert "1 event has no timestamp" in output
+
+
+def test_render_text_shows_accepted_ai_draft() -> None:
+    output = render_text((_case(),), {"case-1": _draft(summary="everything looks fine")})
+    assert "everything looks fine" in output
+    assert "an observation" in output
+    assert "AI-generated draft requiring human review" in output
+
+
+def test_render_text_shows_rejection_notice_for_none_draft() -> None:
+    output = render_text((_case(),), {"case-1": None})
+    assert "REJECTED" in output
 
 
 def test_render_text_marks_undated_events() -> None:
@@ -130,26 +156,29 @@ def test_render_text_marks_undated_events() -> None:
         observed_facts=(),
         evidence_gaps=(),
     )
-    assert "UNDATED" in render_text((case,))
+    assert "UNDATED" in render_text((case,), {"case-2": None})
 
 
 def test_render_text_separates_multiple_cases() -> None:
-    output = render_text((_case(), _case()))
+    output = render_text(
+        (_case(case_id="case-1"), _case(case_id="case-2")),
+        {"case-1": None, "case-2": None},
+    )
     assert output.count("=== Case") == 2
 
 
 def test_render_markdown_empty_cases() -> None:
-    assert "No events to report." in render_markdown(())
+    assert "No events to report." in render_markdown((), {})
 
 
 def test_render_markdown_includes_table_header() -> None:
-    output = render_markdown((_case(),))
+    output = render_markdown((_case(),), {"case-1": None})
     assert "| Timestamp | Host | User | Event ID | Process | Command Line |" in output
     assert "WIN-CLIENT01" in output
 
 
 def test_render_markdown_includes_command_line() -> None:
-    output = render_markdown((_case(command_line="net user alice /active:yes"),))
+    output = render_markdown((_case(command_line="net user alice /active:yes"),), {"case-1": None})
     assert "net user alice /active:yes" in output
 
 
@@ -162,6 +191,17 @@ def test_render_markdown_shows_rule_matches() -> None:
         matched_event_ids=("rec-1",),
         description="Encoded PowerShell command",
     )
-    output = render_markdown((_case(rule_matches=(match,)),))
+    output = render_markdown((_case(rule_matches=(match,)),), {"case-1": None})
     assert "PS-001" in output
     assert "Encoded PowerShell command" in output
+
+
+def test_render_markdown_shows_accepted_ai_draft() -> None:
+    output = render_markdown((_case(),), {"case-1": _draft(summary="looks benign")})
+    assert "looks benign" in output
+    assert "an observation" in output
+
+
+def test_render_markdown_shows_rejection_notice_for_none_draft() -> None:
+    output = render_markdown((_case(),), {"case-1": None})
+    assert "REJECTED" in output
