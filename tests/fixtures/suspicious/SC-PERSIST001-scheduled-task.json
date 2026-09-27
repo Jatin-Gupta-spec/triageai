@@ -1,0 +1,7 @@
+{
+  "original_record_id": "SC-PERSIST001-1",
+  "timestamp": "2026-01-22T16:00:00Z",
+  "host": "WIN-CLIENT01",
+  "event_id": "4698",
+  "command_line": "schtasks.exe /create /tn \"UpdaterTask\" /tr \"C:\\Tools\\updater.exe\" /sc DAILY /st 02:00"
+}

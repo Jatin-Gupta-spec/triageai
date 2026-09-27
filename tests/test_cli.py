@@ -146,3 +146,8 @@ def test_analyze_shows_rule_match_and_ai_observation_for_auth001(
     assert exit_code == 0
     assert "AUTH-001" in captured.out
     assert "MEDIUM" in captured.out
+    # Stage 15 regression guard: a real rule match must NOT cause the
+    # AI draft to be rejected -- this is exactly the bug found by
+    # running the real fixtures by hand.
+    assert "REJECTED" not in captured.out
+    assert "AI-generated draft requiring human review" in captured.out

@@ -4,56 +4,41 @@ Locked default (spec Section 7): Medium severity / Medium confidence,
 mapped to MITRE T1059.001. Detects the PRESENCE of an -EncodedCommand
 style flag in a PowerShell invocation -- NOT whether the encoded
 payload is actually malicious. Per the spec: "Encoding is not
-automatically malicious." Legitimate administration frequently uses
-encoded commands (e.g. to safely pass complex scripts through multiple
-layers of quoting) -- this rule flags the pattern for human review, it
-does not conclude anything about intent.
+automatically malicious."
 
-Detection heuristic, stated explicitly (not spec-locked -- this rule's
-own documented interpretation, same pattern as AUTH-001's event-ID
-list): an event is a candidate PowerShell invocation if its `process`
-field names powershell.exe or pwsh.exe, OR its `command_line` mentions
-either interpreter by name -- covering cases where a parent shell's
-command_line shows the full invocation but `process` itself was not
-populated by the source SIEM. Within a candidate event, the rule fires
-if `command_line` contains a whitespace-delimited flag token matching
-a known -EncodedCommand abbreviation (`-enc` through the full
-`-encodedcommand`, case-insensitive).
+Detection heuristic (this rule's own documented interpretation, not
+spec-locked): an event is a candidate PowerShell invocation if its
+`process` field names powershell.exe or pwsh.exe, OR its
+`command_line` mentions either interpreter by name. Within a candidate
+event, the rule fires if `command_line` contains a whitespace-
+delimited flag token matching a known -EncodedCommand abbreviation
+(`-enc` through the full `-encodedcommand`, case-insensitive). Bare
+`-e` / `-en` are deliberately EXCLUDED -- ambiguous with unrelated
+tools' flags.
 
-Bare `-e` / `-en` are deliberately EXCLUDED from the accepted
-abbreviation list: PowerShell itself accepts them as valid unambiguous
-prefixes, but including them here would make this rule match many
-unrelated flags in unrelated tools' command lines by coincidental
-substring overlap -- a deliberate precision-over-recall tradeoff, not
-an oversight.
+Decoding is opportunistic evidence enrichment, not a precondition to
+fire. Single-pass, never recursive, capped at 64 KiB (MAX_DECODED_
+BYTES). -EncodedCommand payloads are UTF-16LE encoded by PowerShell
+itself before base64; decoding as strict UTF-16LE is deliberate. A
+decode failure produces a recorded decode_error, never raw undecoded
+bytes formatted as text.
 
-Decoding is opportunistic evidence enrichment, not a precondition for
-the rule to fire: a malformed or missing encoded payload still
-produces a match (the flag's presence is the actual detection), it
-simply carries a decode_error/status note instead of decoded text.
-Decoding is single-pass (one base64 decode, never recursive), and
-decoded output is hard-capped at 64 KiB, per the locked operational
-contract -- a payload whose decoded bytes exceed that cap is
-truncated, never fully retained. -EncodedCommand payloads are
-UTF-16LE encoded by PowerShell itself before base64; decoding as
-strict UTF-16LE is deliberate, not a guess. A UTF-16LE decode failure
-falls back to a recorded decode_error, never raw undecoded bytes
-formatted as if they were text.
+Stage 15 addition: a BOUNDED preview of the actual decoded text (up to
+DESCRIPTION_PREVIEW_CHARS) is now included in the RuleMatch
+description -- previously only the fact that decoding succeeded was
+reported, which gave an analyst nothing to actually investigate. This
+preview passes through redact_rule_match_for_render at render time
+(see redaction.py), which as of this same stage runs FULL secret-
+pattern scrubbing on rule descriptions, not just email aliasing --
+closing a real gap where a decoded payload's own embedded secret could
+have rendered unredacted.
 
-Known, cross-cutting gap surfaced by writing this rule -- and it
-turns out to ALSO already apply to AUTH-001, not just here: neither
-RuleMatch nor Case currently has a field for a decoded-content preview
-or any other rendering-safe evidence blob, and Case.rule_matches is
-NOT touched by Stage 6's redact_case_for_render at all. That means
-RuleMatch.description in both this rule and AUTH-001 embeds real,
-unredacted host/identity values directly into a plain string that
-bypasses the render-boundary redaction entirely. It hasn't caused a
-leak yet only because nothing renders rule_matches into a report yet
-(terminal.py/markdown_report.py currently render events only). This is
-a tracked, open item, not something silently ignored -- it needs
-fixing before Stage 11 wires rule_matches into an actual rendered
-report, most likely by extending redact_case_for_render to also
-redact RuleMatch.description.
+Known, cross-cutting, still-open item: RuleMatch.description embeds
+plain (non-email-shaped) hostnames directly (e.g. "host WIN-CLIENT01")
+-- per redaction.py's documented scope decision, a bare hostname is
+not itself redacted anywhere in this project yet. Unchanged from
+Stages 9-11; recorded here again, and in LIMITATIONS.md, so it isn't
+lost.
 """
 
 from __future__ import annotations
@@ -67,6 +52,7 @@ from triageai.models import Confidence, NormalizedEvent, RuleMatch, Severity
 RULE_ID = "PS-001"
 MITRE_TECHNIQUE = "T1059.001"
 MAX_DECODED_BYTES = 64 * 1024
+DESCRIPTION_PREVIEW_CHARS = 300
 
 _POWERSHELL_PROCESS_NAMES = ("powershell.exe", "pwsh.exe")
 _ENCODED_COMMAND_FLAGS = frozenset(
@@ -142,6 +128,20 @@ def decode_encoded_command(payload: str) -> DecodedCommand:
     return DecodedCommand(decoded_text=text, decode_error=None, truncated=truncated)
 
 
+def _describe_decode_result(decoded: DecodedCommand) -> str:
+    if decoded.decode_error is not None:
+        return f"decode attempted, failed ({decoded.decode_error})"
+
+    assert decoded.decoded_text is not None
+    truncation_note = " (decoding truncated at 64 KiB)" if decoded.truncated else ""
+
+    preview = decoded.decoded_text[:DESCRIPTION_PREVIEW_CHARS]
+    if len(decoded.decoded_text) > DESCRIPTION_PREVIEW_CHARS:
+        preview += "...[preview truncated]"
+
+    return f"decoded successfully{truncation_note}: {preview}"
+
+
 def evaluate(events: tuple[NormalizedEvent, ...]) -> tuple[RuleMatch, ...]:
     """Flag every PowerShell invocation carrying an -EncodedCommand-style flag."""
     matches: list[RuleMatch] = []
@@ -157,13 +157,7 @@ def evaluate(events: tuple[NormalizedEvent, ...]) -> tuple[RuleMatch, ...]:
         if payload is None:
             status = "encoded-command flag present, no payload token found"
         else:
-            decoded = decode_encoded_command(payload)
-            if decoded.decode_error is not None:
-                status = f"decode attempted, failed ({decoded.decode_error})"
-            else:
-                assert decoded.decoded_text is not None
-                note = " (truncated at 64 KiB)" if decoded.truncated else ""
-                status = f"decoded successfully, {len(decoded.decoded_text)} chars{note}"
+            status = _describe_decode_result(decode_encoded_command(payload))
 
         matches.append(
             RuleMatch(

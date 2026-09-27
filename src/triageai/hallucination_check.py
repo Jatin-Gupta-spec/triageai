@@ -6,24 +6,40 @@ well-formed; this module proves its CONTENT doesn't invent evidence.
 Per the locked spec: "Mechanically reject structured entity claims not
 present in the evidence allow-list." Four structured entity types are
 checked: hostnames, IP addresses, Windows event IDs, and MITRE
-technique IDs. Free-text prose that names none of these is NOT
-verifiable this way and is intentionally left alone -- per the spec,
-"Free-text prose remains explicitly unverified and human-reviewed."
+technique IDs. Free-text prose that names none of these is left alone,
+per the spec: "Free-text prose remains explicitly unverified and
+human-reviewed."
 
-Detection heuristic, stated explicitly (this module's own documented
-interpretation, same pattern as every rule's own detection logic):
-- An IP-shaped token (dotted-quad pattern) is extracted and checked
-  directly.
-- A MITRE-technique-shaped token (T#### or T####.###) is extracted
-  and checked directly.
-- A 4-digit token is treated as a candidate Windows event ID.
-- Any remaining whitespace-delimited token is checked against the
-  allow-listed HOSTNAMES only if it exactly matches one (case-
-  insensitive) -- this deliberately does NOT attempt fuzzy or
-  substring hostname matching, which would risk both false accusations
-  of hallucination (a real host name that happens to be a common
-  English word) and missed detections (a hallucinated host disguised
-  inside a longer word). Exact, case-insensitive token match only.
+STAGE 15 -- two real bugs found by actually running the mock pipeline
+against real fixtures, not caught by any unit test until then:
+
+1. This project's own rule catalogue IDs (AUTH-001, PS-001,
+   PERSIST-001) are themselves short, hyphenated, alphanumeric tokens
+   -- exactly the shape the hostname heuristic looks for. Since the
+   mock provider's observations always begin with "{rule_id}: ...",
+   EVERY case with a real rule match got its entire AI draft rejected,
+   which defeats the whole point of drafting AI commentary on
+   suspicious activity. Fixed by recognizing a case's own real
+   rule_ids (drawn from case.rule_matches -- genuine, deterministically
+   computed evidence, never an AI invention) as their own allow-listed
+   category, checked BEFORE the hostname heuristic. A rule ID NOT
+   actually present in THIS case's own rule_matches is still correctly
+   rejected -- see test_unlisted_rule_id_is_still_rejected.
+
+2. PowerShell's own naming convention is hyphenated Verb-Noun
+   (Get-Process, Where-Object, Set-ExecutionPolicy...) -- exactly what
+   a decoded PS-001 payload preview embeds directly into an AI
+   observation (see rules/powershell.py, mock.py). The bare "hyphen +
+   alphanumeric" heuristic would have misidentified ordinary decoded
+   PowerShell content as fabricated hostnames the moment a real
+   payload was decoded. Fixed by additionally requiring the candidate
+   token to contain at least one digit -- true of every real hostname
+   in this project's own data (WIN-CLIENT01, WIN-CLIENT02...) and
+   false of ordinary PowerShell cmdlet names. Documented, accepted
+   trade-off: a fabricated hostname containing NO digit at all (e.g.
+   "ATTACKER-BOX") would not be caught by this specific check -- a
+   real, honest limitation, not silently assumed solved (see
+   LIMITATIONS.md).
 
 Per the locked spec's fail-closed rule (Section 8): ANY single
 unsupported structured claim invalidates the ENTIRE draft -- there is
@@ -50,10 +66,11 @@ class HallucinationError(Exception):
 
 def _build_allow_list(case: Case) -> dict[str, set[str]]:
     """Every real, redacted value the case's own evidence supports,
-    grouped by structured entity type. Built from the ALREADY-REDACTED
-    Case -- so an alias like [REDACTED_EMAIL_001] is itself a
-    legitimate allow-listed "host/user" value; the AI never sees real
-    identities to begin with (see redaction.py, prompt_builder.py).
+    grouped by structured entity type.
+
+    "rule_ids" (Stage 15 addition) is this case's own real,
+    deterministically-computed rule matches -- not an AI claim, so
+    referencing one by name is never a hallucination.
     """
     hosts: set[str] = set()
     ips: set[str] = set()
@@ -71,10 +88,17 @@ def _build_allow_list(case: Case) -> dict[str, set[str]]:
             event_ids.add(event.event_id)
         techniques.update(event.mitre_techniques)
 
+    rule_ids = {match.rule_id for match in case.rule_matches}
     for match in case.rule_matches:
         techniques.add(match.mitre_technique)
 
-    return {"hosts": hosts, "ips": ips, "event_ids": event_ids, "techniques": techniques}
+    return {
+        "hosts": hosts,
+        "ips": ips,
+        "event_ids": event_ids,
+        "techniques": techniques,
+        "rule_ids": rule_ids,
+    }
 
 
 def _find_unsupported_claims(text: str, allow_list: dict[str, set[str]]) -> list[str]:
@@ -92,35 +116,39 @@ def _find_unsupported_claims(text: str, allow_list: dict[str, set[str]]) -> list
 
     for event_id in _EVENT_ID_PATTERN.findall(text):
         if event_id not in allow_list["event_ids"]:
-            unsupported.append(
-                f"event ID {event_id!r} not present in this case's evidence"
-            )
+            unsupported.append(f"event ID {event_id!r} not present in this case's evidence")
 
     for token in text.split():
-        cleaned = token.strip(".,:;()[]").lower()
+        stripped = token.strip(".,:;()[]")
+        if stripped in allow_list["rule_ids"]:
+            continue  # this case's own real rule-catalogue ID, not a claimed host
+
+        cleaned = stripped.lower()
         if _looks_like_hostname(cleaned) and cleaned not in allow_list["hosts"]:
-            unsupported.append(f"host {token.strip('.,:;()[]')!r} not present in this case's evidence")
+            unsupported.append(f"host {stripped!r} not present in this case's evidence")
 
     return unsupported
 
 
 def _looks_like_hostname(token: str) -> bool:
-    """A deliberately narrow heuristic: uppercase-style machine names
-    (hyphens, digits, letters, length >= 4) -- narrow enough to avoid
-    flagging ordinary English words in AI prose as suspected hostname
-    claims.
+    """Narrow heuristic: hyphenated, alphanumeric, length >= 4, AND
+    contains at least one digit -- true of every real hostname in this
+    project's own data, false of ordinary PowerShell cmdlet names.
+    Trade-off documented in this module's docstring and LIMITATIONS.md.
     """
-    return bool(re.fullmatch(r"[a-z0-9][a-z0-9-]{3,}", token)) and "-" in token
+    return (
+        bool(re.fullmatch(r"[a-z0-9][a-z0-9-]{3,}", token))
+        and "-" in token
+        and any(char.isdigit() for char in token)
+    )
 
 
 def check_for_hallucination(draft: AIAnalysisDraft, case: Case) -> None:
     """Raise HallucinationError if ANY structured claim in the
     draft's summary or observations is unsupported by the case's own
-    evidence allow-list. Per the locked spec, checked fields are
-    summary and observations -- the fields where the AI is drafting
-    claims ABOUT the evidence, not investigation_questions or
-    recommended_next_steps, which are inherently speculative/
-    forward-looking by design and were never claims of observed fact.
+    evidence allow-list. Checked fields are summary and observations --
+    investigation_questions and recommended_next_steps are inherently
+    speculative/forward-looking and were never claims of observed fact.
     """
     allow_list = _build_allow_list(case)
 

@@ -1,0 +1,8 @@
+{
+  "original_record_id": "SC-PS001-1",
+  "timestamp": "2026-01-21T11:15:00Z",
+  "host": "WIN-CLIENT01",
+  "user": "alice",
+  "process": "powershell.exe",
+  "command_line": "powershell.exe -EncodedCommand RwBlAHQALQBQAHIAbwBjAGUAcwBzACAAfAAgAFcAaABlAHIAZQAtAE8AYgBqAGUAYwB0ACAAQwBQAFUAIAAtAGcAdAAgADkAMAA="
+}

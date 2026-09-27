@@ -39,9 +39,6 @@ def _encode(text: str) -> str:
     return base64.b64encode(text.encode("utf-16-le")).decode("ascii")
 
 
-# --- Positive ---
-
-
 def test_full_flag_with_valid_payload_matches() -> None:
     payload = _encode("Get-Process")
     event = _event(command_line=f"powershell.exe -EncodedCommand {payload}")
@@ -68,9 +65,6 @@ def test_command_line_only_mention_of_powershell_matches() -> None:
     assert len(evaluate((event,))) == 1
 
 
-# --- Negative ---
-
-
 def test_powershell_without_encoded_flag_does_not_match() -> None:
     event = _event(command_line="powershell.exe -File script.ps1")
     assert evaluate((event,)) == ()
@@ -86,9 +80,6 @@ def test_excluded_short_abbreviation_e_does_not_match() -> None:
     payload = _encode("Get-Process")
     event = _event(command_line=f"powershell.exe -e {payload}")
     assert evaluate((event,)) == ()
-
-
-# --- Boundary ---
 
 
 def test_decoded_output_at_exactly_max_bytes_is_not_truncated() -> None:
@@ -112,9 +103,6 @@ def test_shortest_accepted_abbreviation_enc_matches() -> None:
     payload = _encode("x")
     event = _event(command_line=f"powershell.exe -enc {payload}")
     assert len(evaluate((event,))) == 1
-
-
-# --- Missing-field ---
 
 
 def test_command_line_none_does_not_crash_or_match() -> None:
@@ -147,3 +135,15 @@ def test_valid_base64_but_not_utf16le_still_matches_with_decode_error() -> None:
 
 def test_empty_input_produces_no_matches() -> None:
     assert evaluate(()) == ()
+
+
+def test_decoded_payload_content_appears_in_description() -> None:
+    # Stage 15 fix: previously only "decoded successfully, N chars"
+    # was reported -- the actual content is now surfaced so an
+    # analyst has something real to investigate.
+    payload = _encode("Get-Process | Where-Object CPU -gt 100")
+    event = _event(command_line=f"powershell.exe -EncodedCommand {payload}")
+
+    matches = evaluate((event,))
+
+    assert "Get-Process" in matches[0].description

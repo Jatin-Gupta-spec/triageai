@@ -11,25 +11,24 @@ Two distinct redaction behaviors, not to be confused with each other:
    email-like substring becomes a flat, unnumbered "[REDACTED_EMAIL]"
    token. Known secret patterns similarly become flat tokens.
 
-2. Identity-field redaction (structured fields, AND -- as of Stage 11
-   -- rule-match descriptions derived from those same fields): each
-   *distinct* value gets its own numbered alias, assigned by sorting
-   unique NFC-normalized, case-folded values. This is what lets two
-   different accounts stay distinguishable in a rendered report
-   without revealing who they are, and what lets the SAME identity be
-   recognized consistently whether it appears in a structured field or
-   inside a RuleMatch.description string this project's own rules
-   generated.
+2. Identity-field redaction (structured fields, AND rule-match
+   descriptions derived from those same fields, AND -- as of Stage 15
+   -- any secret pattern embedded in a rule-match description, e.g. a
+   decoded PowerShell payload that happens to contain a password):
+   each distinct email-like value gets its own numbered alias, and
+   every secret pattern gets the same flat token treatment as
+   free-text redaction gets. This is what lets two different accounts
+   stay distinguishable while still guaranteeing NO secret pattern
+   survives into a rendered report, regardless of which path (event
+   field or rule-match description) it arrived through.
 
-Documented, deliberate consequence, still true after Stage 11: the
-SAME email address renders differently depending on which REDACTION
-CATEGORY touched it -- flat if it appeared in genuinely free text
-(a command line), numbered if it appeared as a structured identity
-field or in a rule description. This is intentional: free text
-carries no correlation requirement, so there is nothing to preserve by
-numbering it.
+Documented, deliberate consequence, unchanged since Stage 11: the SAME
+email address renders differently depending on which REDACTION
+CATEGORY touched it -- flat if it appeared in genuinely free text (a
+command line), numbered if it appeared as a structured identity field
+or in a rule description.
 
-Scope decision, unchanged from Stage 6: identity fields that do NOT
+Scope decision, unchanged since Stage 6: identity fields that do NOT
 look like an email (a plain "alice", not "alice@corp.local") are NOT
 redacted by this module -- a real product decision this project
 hasn't made yet, not an oversight.
@@ -110,13 +109,24 @@ class EmailAliaser:
 
 
 def redact_text_with_aliases(text: str, aliaser: EmailAliaser) -> str:
-    """Replace every email-like substring in `text` with its STABLE,
-    numbered alias -- unlike redact_free_text's flat, unnumbered
-    token, this keeps one identity mapped to one alias everywhere it
-    appears in a rendered case, including inside a RuleMatch
-    description this project's own rules generated.
+    """Full redaction for text embedded in a rule-match description or
+    similar rendered-but-derived text: secret patterns are scrubbed to
+    flat tokens FIRST (same as redact_free_text), THEN any remaining
+    email-like substring is replaced with its STABLE, numbered alias
+    -- unlike redact_free_text's flat, unnumbered email token, this
+    keeps one identity mapped to one alias everywhere it appears in a
+    rendered case.
+
+    Stage 15 fix: previously only did email aliasing, silently
+    skipping secret-pattern scrubbing -- meaning a decoded PowerShell
+    payload embedded in a rule description containing a real password
+    or token would have rendered unredacted. Closed by running the
+    same _SECRET_PATTERNS pass redact_free_text uses, before aliasing.
     """
-    return EMAIL_PATTERN.sub(lambda m: aliaser.alias_for(m.group(0)), text)
+    redacted = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return EMAIL_PATTERN.sub(lambda m: aliaser.alias_for(m.group(0)), redacted)
 
 
 def redact_event_for_render(event: NormalizedEvent, aliaser: EmailAliaser) -> NormalizedEvent:
@@ -138,9 +148,9 @@ def redact_event_for_render(event: NormalizedEvent, aliaser: EmailAliaser) -> No
 def redact_rule_match_for_render(match: RuleMatch, aliaser: EmailAliaser) -> RuleMatch:
     """Produce a REDACTED COPY of one RuleMatch, safe for a report or prompt.
 
-    Known, documented, accepted limitation, same as elsewhere in this
-    module: a PLAIN (non-email-shaped) identity in `description` --
-    e.g. a bare hostname like "WIN-CLIENT01" -- is NOT redacted here.
+    Known, documented, accepted limitation, unchanged: a PLAIN
+    (non-email-shaped) identity in `description` -- e.g. a bare
+    hostname like "WIN-CLIENT01" -- is NOT redacted here.
     """
     return replace(match, description=redact_text_with_aliases(match.description, aliaser))
 
@@ -149,9 +159,7 @@ def _collect_identity_seed_values(case: Case) -> list[str]:
     """Every value that must be in the aliaser's dictionary BEFORE
     alias_for() is called on it anywhere -- structured identity fields
     from every event, plus any email-like substring already sitting in
-    a rule-match description. Missing a value here was the exact
-    latent bug this function fixes: alias_for() raises KeyError on an
-    email-shaped value it was never told about in advance.
+    a rule-match description.
     """
     values: list[str] = []
     for event in case.normalized_events:

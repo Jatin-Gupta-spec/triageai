@@ -27,6 +27,17 @@ def _event(host: str = "WIN-CLIENT01", event_id: str = "4625") -> NormalizedEven
     )
 
 
+def _match(rule_id: str = "AUTH-001", mitre_technique: str = "T1110") -> RuleMatch:
+    return RuleMatch(
+        rule_id=rule_id,
+        mitre_technique=mitre_technique,
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
+        matched_event_ids=("rec-1",),
+        description="",
+    )
+
+
 def _case(rule_matches: tuple[RuleMatch, ...] = ()) -> Case:
     return Case(
         case_id="case-1",
@@ -105,9 +116,6 @@ def test_ordinary_english_word_is_not_flagged_as_hostname() -> None:
 
 
 def test_investigation_questions_are_not_checked() -> None:
-    # Per this module's design: only summary/observations are claims
-    # of fact. A question can freely reference a hypothetical host
-    # without being treated as a hallucinated factual claim.
     draft = AIAnalysisDraft(
         summary="ok",
         observations=(),
@@ -136,3 +144,38 @@ def test_empty_case_evidence_still_allows_generic_summary() -> None:
     )
     draft = _draft(summary="No events were observed in this case.")
     check_for_hallucination(draft, empty_case)  # must not raise
+
+
+# --- Stage 15: real bugs found by running the real fixtures ---
+
+
+def test_rule_id_reference_in_observation_is_not_flagged_as_hallucinated_host() -> None:
+    case = _case(rule_matches=(_match(rule_id="AUTH-001"),))
+    draft = _draft(
+        summary="1 deterministic rule match(es) found (AUTH-001) for host(s) WIN-CLIENT01.",
+        observations=("AUTH-001: 5 authentication failures for user:bob on host WIN-CLIENT01",),
+    )
+    check_for_hallucination(draft, case)  # must not raise
+
+
+def test_unlisted_rule_id_is_still_rejected() -> None:
+    case = _case(rule_matches=(_match(rule_id="AUTH-001"),))
+    draft = _draft(summary="This also looks consistent with a PS-001 finding.")
+
+    with pytest.raises(HallucinationError, match="PS-001"):
+        check_for_hallucination(draft, case)
+
+
+def test_powershell_cmdlet_style_tokens_without_digits_are_not_flagged_as_hostnames() -> None:
+    draft = _draft(observations=("decoded successfully: Get-Process | Where-Object CPU -gt 90",))
+    check_for_hallucination(draft, _case())  # must not raise
+
+
+def test_full_mock_style_ps001_observation_with_decoded_payload_passes() -> None:
+    case = _case(rule_matches=(_match(rule_id="PS-001", mitre_technique="T1059.001"),))
+    observation_text = (
+        "PS-001: Encoded PowerShell command on host WIN-CLIENT01: "
+        "decoded successfully: Get-Process | Where-Object CPU -gt 90"
+    )
+    draft = _draft(observations=(observation_text,))
+    check_for_hallucination(draft, case)  # must not raise

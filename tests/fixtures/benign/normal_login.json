@@ -1,0 +1,16 @@
+{
+  "original_record_id": "SOC-LAB-BENIGN-001",
+  "timestamp": "2026-01-15T09:03:12Z",
+  "host": "WIN-CLIENT01",
+  "user": "alice",
+  "source": "wazuh",
+  "event_id": "4624",
+  "provider": "Microsoft-Windows-Security-Auditing",
+  "rule_id": "5715",
+  "process": null,
+  "parent_process": null,
+  "command_line": null,
+  "source_ip": "192.168.56.10",
+  "destination_ip": null,
+  "mitre_techniques": []
+}

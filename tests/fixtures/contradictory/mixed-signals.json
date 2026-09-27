@@ -1,0 +1,8 @@
+[
+  {"original_record_id": "MIX-1", "timestamp": "2026-02-10T02:00:00Z", "host": "WIN-CLIENT03", "event_id": "4698", "command_line": "schtasks.exe /create /tn \"Windows Update Check\" /tr \"C:\\Windows\\System32\\update_check.exe\" /sc DAILY /st 03:00"},
+  {"original_record_id": "MIX-2", "timestamp": "2026-02-10T02:05:00Z", "host": "WIN-CLIENT03", "user": "svcaccount", "event_id": "4625"},
+  {"original_record_id": "MIX-3", "timestamp": "2026-02-10T02:07:00Z", "host": "WIN-CLIENT03", "user": "svcaccount", "event_id": "4625"},
+  {"original_record_id": "MIX-4", "timestamp": "2026-02-10T02:09:00Z", "host": "WIN-CLIENT03", "user": "svcaccount", "event_id": "4625"},
+  {"original_record_id": "MIX-5", "timestamp": "2026-02-10T02:11:00Z", "host": "WIN-CLIENT03", "user": "svcaccount", "event_id": "4625"},
+  {"original_record_id": "MIX-6", "timestamp": "2026-02-10T02:13:00Z", "host": "WIN-CLIENT03", "user": "svcaccount", "event_id": "4625"}
+]
