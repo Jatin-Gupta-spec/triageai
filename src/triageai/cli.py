@@ -19,6 +19,7 @@ from triageai.models import AIAnalysisDraft, Case, NormalizedEvent, ScanSummary
 from triageai.normalization import normalize_event
 from triageai.output_validation import OutputValidationError, validate_ai_output
 from triageai.prompt_builder import build_prompt
+from triageai.providers.base import AIProvider, ProviderError
 from triageai.providers.mock import MockProvider
 from triageai.readers.wazuh_json import RawRecord, read_input
 from triageai.redaction import redact_case_for_render
@@ -56,16 +57,9 @@ class _NormalizationResult:
 
 def _normalize_records(raw_records: tuple[RawRecord, ...]) -> _NormalizationResult:
     """Validate each raw record is a JSON object, normalize it, and
-    deduplicate by original_record_id.
-
-    Fix: the locked spec (Section 5, present since the very first
-    version of this project's spec) requires "Deduplicate by
-    original_record_id and report the duplicate count" -- this was
-    never actually implemented until now, across all 15 build stages.
-    The FIRST occurrence of a given ID, in the deterministic
-    file/record order read_input already produces, is kept; every
-    LATER occurrence of the same ID is counted as a duplicate and
-    dropped, never double-processed by correlation or the rules.
+    deduplicate by original_record_id. The FIRST occurrence of a given
+    ID, in the deterministic file/record order read_input produces, is
+    kept; every later occurrence is counted as a duplicate and dropped.
     """
     seen_ids: set[str] = set()
     events: list[NormalizedEvent] = []
@@ -91,13 +85,25 @@ def _normalize_records(raw_records: tuple[RawRecord, ...]) -> _NormalizationResu
     )
 
 
-def _generate_validated_draft(redacted_case: Case) -> AIAnalysisDraft | None:
-    """Run the full mock-AI pipeline for one case: generate, validate
-    shape, validate content. Returns None if EITHER validation layer
-    rejects the draft -- per the locked spec's fail-closed rule.
+def _generate_validated_draft(
+    redacted_case: Case, provider: AIProvider | None = None
+) -> AIAnalysisDraft | None:
+    """Run the full AI pipeline for one case: build the prompt, ask the
+    provider, validate shape, validate content. Returns None if the
+    provider fails or EITHER validation layer rejects the draft -- per
+    the locked spec's fail-closed rule.
+
+    `provider` exists so tests can exercise the rejection paths with a
+    misbehaving provider. The CLI itself always uses the default mock;
+    the locked v0.1 command-line surface is unchanged.
     """
-    provider = MockProvider()
-    raw_text = provider.generate(redacted_case)
+    active_provider = provider if provider is not None else MockProvider()
+    prompt = build_prompt(redacted_case)
+
+    try:
+        raw_text = active_provider.generate(prompt)
+    except ProviderError:
+        return None
 
     try:
         draft = validate_ai_output(raw_text)
@@ -159,10 +165,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         cases=cases,
     )
 
-    ai_drafts: dict[str, AIAnalysisDraft | None] = {}
-    for case in redacted_cases:
-        build_prompt(case)  # exercises the full pipeline; see prompt_builder.py
-        ai_drafts[case.case_id] = _generate_validated_draft(case)
+    ai_drafts: dict[str, AIAnalysisDraft | None] = {
+        case.case_id: _generate_validated_draft(case) for case in redacted_cases
+    }
 
     print(_format_scan_summary(scan_summary))
     if parsed.format == "markdown":

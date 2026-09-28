@@ -1,27 +1,34 @@
 """Interface every AI provider must implement.
 
-A provider receives an ALREADY-REDACTED Case (see redaction.py) and
-returns RAW TEXT -- the same shape a real HTTP API response would
-take, whether or not this particular provider is actually an API.
-Nothing at this boundary is trusted: output_validation.py is solely
-responsible for turning that raw text into a trusted AIAnalysisDraft,
-or rejecting it outright. This project's core principle applies
-without exception here: nothing a provider returns is treated as fact
-until validated.
+Stage 17b: a provider now receives the FINAL, bounded prompt text --
+exactly what prompt_builder.build_prompt produced from an already-
+redacted Case -- and returns RAW TEXT. Previously the mock received a
+Case object directly, so the injection-resistant prompt boundary this
+project built was never the boundary a provider actually consumed.
+Every provider, including future local or cloud ones, gets the same
+input type.
+
+Nothing a provider returns is trusted: output_validation.py and
+hallucination_check.py decide whether it is accepted.
 """
 
 from __future__ import annotations
 
 from typing import Protocol
 
-from triageai.models import Case
+
+class ProviderError(Exception):
+    """A provider could not produce output at all (for example, its
+    prompt was malformed or a backend was unavailable). The caller
+    treats this exactly like a rejected draft: no AI content is shown
+    and the deterministic report is unaffected.
+    """
 
 
 class AIProvider(Protocol):
-    def generate(self, redacted_case: Case) -> str:
+    def generate(self, prompt: str) -> str:
         """Return raw text, expected to be a JSON object matching the
         locked AI output schema -- but this method makes no such
-        guarantee. Malformed or incomplete text is exactly what
-        output_validation.py exists to catch.
+        guarantee. Raise ProviderError if no output can be produced.
         """
         ...

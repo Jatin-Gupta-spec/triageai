@@ -1,60 +1,65 @@
 """Validates AI-claimed structured entities against the case's own
 evidence allow-list -- layered ON TOP OF output_validation.py's shape
-checking, not instead of it. output_validation proves the JSON is
-well-formed; this module proves its CONTENT doesn't invent evidence.
+checking. output_validation proves the JSON is well-formed; this
+module proves its CONTENT doesn't invent evidence.
 
-Per the locked spec: "Mechanically reject structured entity claims not
-present in the evidence allow-list." Four structured entity types are
-checked: hostnames, IP addresses, Windows event IDs, and MITRE
-technique IDs. Free-text prose that names none of these is left alone,
-per the spec: "Free-text prose remains explicitly unverified and
-human-reviewed."
+Four entity types are checked: hostnames, IP addresses, Windows event
+IDs, and MITRE technique IDs. Free-text prose naming none of these is
+left alone: it stays explicitly unverified and human-reviewed.
 
-STAGE 15 -- two real bugs found by actually running the mock pipeline
-against real fixtures, not caught by any unit test until then:
+Stage 17b changes:
 
-1. This project's own rule catalogue IDs (AUTH-001, PS-001,
-   PERSIST-001) are themselves short, hyphenated, alphanumeric tokens
-   -- exactly the shape the hostname heuristic looks for. Since the
-   mock provider's observations always begin with "{rule_id}: ...",
-   EVERY case with a real rule match got its entire AI draft rejected,
-   which defeats the whole point of drafting AI commentary on
-   suspicious activity. Fixed by recognizing a case's own real
-   rule_ids (drawn from case.rule_matches -- genuine, deterministically
-   computed evidence, never an AI invention) as their own allow-listed
-   category, checked BEFORE the hostname heuristic. A rule ID NOT
-   actually present in THIS case's own rule_matches is still correctly
-   rejected -- see test_unlisted_rule_id_is_still_rejected.
+1. Every prose field is checked: summary, observations, investigation
+   questions, evidence gaps, possible false positives, and recommended
+   next steps. unsupported_claims is NOT checked: it is where a
+   provider lists things it could not confirm, so an entity there is
+   an honest doubt, not a claim of fact.
 
-2. PowerShell's own naming convention is hyphenated Verb-Noun
-   (Get-Process, Where-Object, Set-ExecutionPolicy...) -- exactly what
-   a decoded PS-001 payload preview embeds directly into an AI
-   observation (see rules/powershell.py, mock.py). The bare "hyphen +
-   alphanumeric" heuristic would have misidentified ordinary decoded
-   PowerShell content as fabricated hostnames the moment a real
-   payload was decoded. Fixed by additionally requiring the candidate
-   token to contain at least one digit -- true of every real hostname
-   in this project's own data (WIN-CLIENT01, WIN-CLIENT02...) and
-   false of ordinary PowerShell cmdlet names. Documented, accepted
-   trade-off: a fabricated hostname containing NO digit at all (e.g.
-   "ATTACKER-BOX") would not be caught by this specific check -- a
-   real, honest limitation, not silently assumed solved (see
-   LIMITATIONS.md).
+2. The allow-list now also includes entities found in text that Python
+   itself produced: rule-match descriptions, observed facts, and
+   evidence gaps. The spec allows claims traceable to "evidence or
+   deterministic rule output", and the AI is shown those texts. This
+   also fixes a real false rejection: a rule description such as a
+   decode-error message contains tokens like "UTF-16LE" that used to
+   be flagged as fabricated hostnames.
+
+3. An event ID is only recognized when the word "event" (or "event
+   ID") comes right before the number. Previously any standalone
+   4-digit number was treated as an event ID, so a year inside a
+   timestamp, or "Start-Sleep 5000" in a decoded payload, got the
+   whole draft rejected.
+
+4. Hostname heuristic, stated explicitly: a token is a candidate host
+   if it is hyphenated, at least 4 characters, alphanumeric plus
+   hyphens, contains a letter, does not end in a hyphen, AND either
+   contains a digit or is all uppercase. That still catches
+   WIN-CLIENT01 and ATTACKER-BOX but not PowerShell cmdlets such as
+   Get-Process, and not date-like tokens such as 2026-01-25.
+
+This case's own real rule IDs (AUTH-001 and so on) are allow-listed.
+
+Documented limits, not silently assumed solved: claims about users,
+processes, and timestamps are not checked; fully qualified domain
+names and hostnames without a hyphen are not detected; an event ID is
+only checked for the first number after "event"; a lookalike or
+obfuscated entity is not detected.
 
 Per the locked spec's fail-closed rule (Section 8): ANY single
-unsupported structured claim invalidates the ENTIRE draft -- there is
-no partial acceptance, no stripping just the offending claim.
+unsupported structured claim invalidates the ENTIRE draft.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from triageai.models import AIAnalysisDraft, Case
 
 _IP_PATTERN = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 _MITRE_PATTERN = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
-_EVENT_ID_PATTERN = re.compile(r"\b\d{4}\b")
+_EVENT_ID_PATTERN = re.compile(r"\bevents?(?:[\s_]*ids?)?\s*[:=#]?\s*(\d{4})\b", re.IGNORECASE)
+_HOSTNAME_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,}")
+_TOKEN_STRIP_CHARS = ".,:;()[]\"'"
 
 
 class HallucinationError(Exception):
@@ -64,18 +69,38 @@ class HallucinationError(Exception):
     """
 
 
-def _build_allow_list(case: Case) -> dict[str, set[str]]:
-    """Every real, redacted value the case's own evidence supports,
-    grouped by structured entity type.
+@dataclass(frozen=True, slots=True)
+class _AllowList:
+    ips: frozenset[str]
+    techniques: frozenset[str]
+    event_ids: frozenset[str]
+    hosts: frozenset[str]  # lowercased; includes this case's own rule IDs
 
-    "rule_ids" (Stage 15 addition) is this case's own real,
-    deterministically-computed rule matches -- not an AI claim, so
-    referencing one by name is never a hallucination.
-    """
-    hosts: set[str] = set()
+
+def _looks_like_hostname(token: str) -> bool:
+    if not _HOSTNAME_SHAPE.fullmatch(token):
+        return False
+    if "-" not in token or token.endswith("-"):
+        return False
+    if not any(char.isalpha() for char in token):
+        return False
+    return any(char.isdigit() for char in token) or token.isupper()
+
+
+def _hostname_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw_token in text.split():
+        token = raw_token.strip(_TOKEN_STRIP_CHARS)
+        if _looks_like_hostname(token):
+            tokens.append(token)
+    return tokens
+
+
+def _build_allow_list(case: Case) -> _AllowList:
     ips: set[str] = set()
-    event_ids: set[str] = set()
     techniques: set[str] = set()
+    event_ids: set[str] = set()
+    hosts: set[str] = set()
 
     for event in case.normalized_events:
         if event.host is not None:
@@ -88,74 +113,68 @@ def _build_allow_list(case: Case) -> dict[str, set[str]]:
             event_ids.add(event.event_id)
         techniques.update(event.mitre_techniques)
 
-    rule_ids = {match.rule_id for match in case.rule_matches}
+    trusted_texts: list[str] = [*case.observed_facts, *case.evidence_gaps]
     for match in case.rule_matches:
         techniques.add(match.mitre_technique)
+        hosts.add(match.rule_id.lower())
+        trusted_texts.append(match.description)
 
-    return {
-        "hosts": hosts,
-        "ips": ips,
-        "event_ids": event_ids,
-        "techniques": techniques,
-        "rule_ids": rule_ids,
-    }
+    for text in trusted_texts:
+        ips.update(_IP_PATTERN.findall(text))
+        techniques.update(_MITRE_PATTERN.findall(text))
+        event_ids.update(_EVENT_ID_PATTERN.findall(text))
+        hosts.update(token.lower() for token in _hostname_tokens(text))
+
+    return _AllowList(
+        ips=frozenset(ips),
+        techniques=frozenset(techniques),
+        event_ids=frozenset(event_ids),
+        hosts=frozenset(hosts),
+    )
 
 
-def _find_unsupported_claims(text: str, allow_list: dict[str, set[str]]) -> list[str]:
+def _find_unsupported_claims(text: str, allow_list: _AllowList) -> list[str]:
     unsupported: list[str] = []
 
     for ip in _IP_PATTERN.findall(text):
-        if ip not in allow_list["ips"]:
+        if ip not in allow_list.ips:
             unsupported.append(f"IP address {ip!r} not present in this case's evidence")
 
     for technique in _MITRE_PATTERN.findall(text):
-        if technique not in allow_list["techniques"]:
-            unsupported.append(
-                f"MITRE technique {technique!r} not present in this case's evidence"
-            )
+        if technique not in allow_list.techniques:
+            unsupported.append(f"MITRE technique {technique!r} not present in this case's evidence")
 
     for event_id in _EVENT_ID_PATTERN.findall(text):
-        if event_id not in allow_list["event_ids"]:
+        if event_id not in allow_list.event_ids:
             unsupported.append(f"event ID {event_id!r} not present in this case's evidence")
 
-    for token in text.split():
-        stripped = token.strip(".,:;()[]")
-        if stripped in allow_list["rule_ids"]:
-            continue  # this case's own real rule-catalogue ID, not a claimed host
-
-        cleaned = stripped.lower()
-        if _looks_like_hostname(cleaned) and cleaned not in allow_list["hosts"]:
-            unsupported.append(f"host {stripped!r} not present in this case's evidence")
+    for token in _hostname_tokens(text):
+        if token.lower() not in allow_list.hosts:
+            unsupported.append(f"host {token!r} not present in this case's evidence")
 
     return unsupported
 
 
-def _looks_like_hostname(token: str) -> bool:
-    """Narrow heuristic: hyphenated, alphanumeric, length >= 4, AND
-    contains at least one digit -- true of every real hostname in this
-    project's own data, false of ordinary PowerShell cmdlet names.
-    Trade-off documented in this module's docstring and LIMITATIONS.md.
-    """
-    return (
-        bool(re.fullmatch(r"[a-z0-9][a-z0-9-]{3,}", token))
-        and "-" in token
-        and any(char.isdigit() for char in token)
-    )
+def _checked_texts(draft: AIAnalysisDraft) -> list[str]:
+    return [
+        draft.summary,
+        *draft.observations,
+        *draft.investigation_questions,
+        *draft.evidence_gaps,
+        *draft.possible_false_positives,
+        *draft.recommended_next_steps,
+    ]
 
 
 def check_for_hallucination(draft: AIAnalysisDraft, case: Case) -> None:
-    """Raise HallucinationError if ANY structured claim in the
-    draft's summary or observations is unsupported by the case's own
-    evidence allow-list. Checked fields are summary and observations --
-    investigation_questions and recommended_next_steps are inherently
-    speculative/forward-looking and were never claims of observed fact.
+    """Raise HallucinationError if ANY structured claim in any checked
+    prose field is unsupported by the case's own evidence allow-list.
     """
     allow_list = _build_allow_list(case)
 
     all_unsupported: list[str] = []
-    all_unsupported.extend(_find_unsupported_claims(draft.summary, allow_list))
-    for observation in draft.observations:
-        all_unsupported.extend(_find_unsupported_claims(observation, allow_list))
+    for text in _checked_texts(draft):
+        all_unsupported.extend(_find_unsupported_claims(text, allow_list))
 
     if all_unsupported:
-        raise HallucinationError("; ".join(all_unsupported))
+        raise HallucinationError("; ".join(dict.fromkeys(all_unsupported)))
