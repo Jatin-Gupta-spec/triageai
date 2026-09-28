@@ -3,9 +3,24 @@
 This module turns bytes on disk into raw, decoded JSON values. It
 performs NO event-shape validation and NO rule evaluation -- only:
 size limits, encoding rules, duplicate-key rejection, non-finite
-numeric constant rejection, symlink-safe directory traversal, and the
-per-analysis record cap. Schema validation and normalization into
-NormalizedEvent happen in normalization.py.
+numeric constant rejection, link-safe traversal, and the per-analysis
+record cap. Normalization into NormalizedEvent happens in
+normalization.py.
+
+Stage 17c link policy. The locked spec says "do not follow symlinks or
+Windows junctions". A path is treated as a link (_is_link_like) if it
+is a symbolic link, a Windows junction, or a Windows reparse point
+whose tag is symlink or mount point. Other reparse points, such as
+OneDrive cloud placeholders, are ordinary files and are read.
+- The input path itself: rejected with an error (exit code 2). Before
+  this, a symlink given directly on the command line was followed.
+- Files inside a scanned directory: skipped and counted.
+- Directories inside a scanned directory: not descended into.
+
+Documented limits (also in LIMITATIONS.md): only the final path
+component and entries found during a scan are checked, not parent
+folders of the input path; the check happens before the read, so a
+link swapped in between is not caught.
 """
 
 from __future__ import annotations
@@ -29,6 +44,11 @@ _UTF_BOMS: tuple[bytes, ...] = (
     b"\xef\xbb\xbf",      # UTF-8
 )
 
+# Windows reparse tags that make a path a link: symlink and mount point
+# (a directory junction). Defined here so the code type-checks and runs
+# the same on every platform.
+_LINK_REPARSE_TAGS = frozenset({0xA000000C, 0xA0000003})
+
 
 @dataclass(frozen=True, slots=True)
 class RawRecord:
@@ -47,17 +67,39 @@ class ReadResult:
     files_skipped_symlink: int
 
 
+def _is_link_like(path: Path) -> bool:
+    """True if `path` itself is a symlink, a junction, or a symlink/
+    mount-point reparse point. Missing or unreadable paths are not
+    links; the caller's normal existence checks report those.
+    """
+    try:
+        if path.is_symlink():
+            return True
+        stat_result = path.lstat()
+    except OSError:
+        return False
+
+    if getattr(stat_result, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS:
+        return True
+
+    is_junction = getattr(os.path, "isjunction", None)  # Python 3.12+
+    return bool(is_junction is not None and is_junction(path))
+
+
 def read_input(path: Path) -> ReadResult:
     """Read one JSON file, or every .json file in a directory tree.
 
     Raises:
-        TriageInputError: for a missing path, an oversized file, a BOM
-            or encoding violation, malformed JSON, a duplicate object
-            key, a non-finite numeric constant (NaN/Infinity/
-            -Infinity -- rejected here rather than crashing later in
-            canonicalize(); see _reject_non_finite_constant), or if
-            the per-analysis record cap would be exceeded.
+        TriageInputError: for an input path that is a symlink or
+            junction, a missing path, an oversized file, a BOM or
+            encoding violation, malformed JSON, a duplicate object
+            key, a non-finite numeric constant, or if the per-analysis
+            record cap would be exceeded.
     """
+    if _is_link_like(path):
+        raise TriageInputError(
+            f"input path is a symbolic link or junction; refusing to follow it: {path}"
+        )
     if path.is_dir():
         return _read_directory(path)
     if path.is_file():
@@ -67,18 +109,18 @@ def read_input(path: Path) -> ReadResult:
 
 def _read_directory(root: Path) -> ReadResult:
     kept: list[Path] = []
-    skipped_symlinks = 0
+    skipped_links = 0
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         current_dir = Path(dirpath)
-        dirnames[:] = [d for d in dirnames if not (current_dir / d).is_symlink()]
+        dirnames[:] = [d for d in dirnames if not _is_link_like(current_dir / d)]
 
         for filename in filenames:
             candidate = current_dir / filename
             if candidate.suffix.lower() != ".json":
                 continue
-            if candidate.is_symlink():
-                skipped_symlinks += 1
+            if _is_link_like(candidate):
+                skipped_links += 1
                 continue
             kept.append(candidate)
 
@@ -92,7 +134,7 @@ def _read_directory(root: Path) -> ReadResult:
     return ReadResult(
         raw_records=tuple(all_records),
         files_read=len(kept),
-        files_skipped_symlink=skipped_symlinks,
+        files_skipped_symlink=skipped_links,
     )
 
 
@@ -177,13 +219,8 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 def _reject_non_finite_constant(constant: str) -> NoReturn:
     """Callback for json.loads's parse_constant hook.
 
-    Fix: Python's json module, by default, accepts the literal tokens
-    NaN, Infinity, and -Infinity as valid JSON numbers (a non-standard
-    extension). Left unhandled, a non-finite float later reached
-    normalization.py's canonicalize(), which calls json.dumps(...,
-    allow_nan=False) -- correctly rejecting it, but as an UNCAUGHT
-    ValueError, crashing with a raw traceback instead of a controlled
-    TriageInputError / exit code 2. Rejecting the constant here closes
-    that gap for all three constants at once, at the earliest point.
+    Python's json module accepts NaN, Infinity and -Infinity by
+    default. Rejecting them here, at the earliest point, keeps a
+    non-finite float from reaching canonicalize() and crashing there.
     """
     raise ValueError(f"non-finite numeric constant not allowed in JSON: {constant}")

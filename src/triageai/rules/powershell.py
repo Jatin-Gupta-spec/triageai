@@ -17,28 +17,31 @@ delimited flag token matching a known -EncodedCommand abbreviation
 tools' flags.
 
 Decoding is opportunistic evidence enrichment, not a precondition to
-fire. Single-pass, never recursive, capped at 64 KiB (MAX_DECODED_
-BYTES). -EncodedCommand payloads are UTF-16LE encoded by PowerShell
-itself before base64; decoding as strict UTF-16LE is deliberate. A
-decode failure produces a recorded decode_error, never raw undecoded
-bytes formatted as text.
+fire. Stage 17c makes the locked decode bounds real:
+- ONE base64 decode, never recursive, never executed.
+- A payload whose text is longer than MAX_ENCODED_CHARS cannot fit in
+  MAX_DECODED_BYTES, so it is REFUSED before the decoder runs. A
+  shorter payload can decode to at most about 64 KiB, and the exact
+  MAX_DECODED_BYTES limit is checked right after. An oversized payload
+  is refused, not truncated: no decoded text is retained. (The 5 MiB
+  input-file cap already bounded the old behaviour to a few MB, so
+  this was a contract violation more than an attack.)
+- The bytes are interpreted as strict UTF-16LE, which is how
+  PowerShell encodes them before base64.
+- On a UTF-16LE failure only a short hex preview of the first
+  BYTE_PREVIEW_BYTES bytes and the byte count are kept, never the
+  decoded bytes as text. Error texts are fixed wording, not copies of
+  an exception message.
 
-Stage 15 addition: a BOUNDED preview of the actual decoded text (up to
-DESCRIPTION_PREVIEW_CHARS) is now included in the RuleMatch
-description -- previously only the fact that decoding succeeded was
-reported, which gave an analyst nothing to actually investigate. This
-preview passes through redact_rule_match_for_render at render time
-(see redaction.py), which as of this same stage runs FULL secret-
-pattern scrubbing on rule descriptions, not just email aliasing --
-closing a real gap where a decoded payload's own embedded secret could
-have rendered unredacted.
+A bounded preview of successfully decoded text (up to
+DESCRIPTION_PREVIEW_CHARS) is included in the RuleMatch description.
+It passes through redaction at render time, which scrubs secret
+patterns in rule descriptions.
 
-Known, cross-cutting, still-open item: RuleMatch.description embeds
-plain (non-email-shaped) hostnames directly (e.g. "host WIN-CLIENT01")
--- per redaction.py's documented scope decision, a bare hostname is
-not itself redacted anywhere in this project yet. Unchanged from
-Stages 9-11; recorded here again, and in LIMITATIONS.md, so it isn't
-lost.
+Known, still-open item: RuleMatch.description embeds plain
+(non-email-shaped) hostnames directly. Per redaction.py's documented
+scope decision, a bare hostname is not itself redacted anywhere in
+this project yet; see LIMITATIONS.md.
 """
 
 from __future__ import annotations
@@ -52,7 +55,13 @@ from triageai.models import Confidence, NormalizedEvent, RuleMatch, Severity
 RULE_ID = "PS-001"
 MITRE_TECHNIQUE = "T1059.001"
 MAX_DECODED_BYTES = 64 * 1024
+# Longest base64 text that can still decode to MAX_DECODED_BYTES bytes:
+# 4 characters per 3 bytes, rounded up to whole 4-character groups.
+MAX_ENCODED_CHARS = ((MAX_DECODED_BYTES + 2) // 3) * 4
+BYTE_PREVIEW_BYTES = 16
 DESCRIPTION_PREVIEW_CHARS = 300
+
+_REFUSED_MESSAGE = "encoded payload is longer than the 64 KiB decode limit allows"
 
 _POWERSHELL_PROCESS_NAMES = ("powershell.exe", "pwsh.exe")
 _ENCODED_COMMAND_FLAGS = frozenset(
@@ -75,11 +84,18 @@ _ENCODED_COMMAND_FLAGS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class DecodedCommand:
-    """Result of attempting to decode one -EncodedCommand payload."""
+    """Result of attempting to decode one -EncodedCommand payload.
+
+    Exactly one of these holds: decoded_text is set (success);
+    refused is True (payload over the size limit, decoder not
+    trusted with it); or decode_error is set (invalid base64 or not
+    UTF-16LE). byte_preview is set only for a UTF-16LE failure.
+    """
 
     decoded_text: str | None
     decode_error: str | None
-    truncated: bool
+    byte_preview: str | None
+    refused: bool = False
 
 
 def _is_powershell_event(event: NormalizedEvent) -> bool:
@@ -106,40 +122,50 @@ def _find_encoded_payload(command_line: str) -> str | None:
 def decode_encoded_command(payload: str) -> DecodedCommand:
     """Single-pass, bounded, inert decode of one base64 -EncodedCommand payload.
 
-    Never executed, never recursively decoded. Decoded output is
-    capped at MAX_DECODED_BYTES; a UTF-16LE decode failure yields
-    decode_error plus None, never raw undecoded bytes formatted as text.
+    Never executed, never recursively decoded. The size limit is
+    enforced before the decoder runs (see the module docstring), so
+    the decoder is never handed a payload that could exceed it.
     """
-    try:
-        raw_bytes = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        return DecodedCommand(decoded_text=None, decode_error=f"invalid base64: {exc}", truncated=False)
-
-    truncated = len(raw_bytes) > MAX_DECODED_BYTES
-    bounded_bytes = raw_bytes[:MAX_DECODED_BYTES]
-
-    try:
-        text = bounded_bytes.decode("utf-16-le", errors="strict")
-    except UnicodeDecodeError as exc:
+    if len(payload) > MAX_ENCODED_CHARS:
         return DecodedCommand(
-            decoded_text=None, decode_error=f"not valid UTF-16LE: {exc}", truncated=truncated
+            decoded_text=None, decode_error=_REFUSED_MESSAGE, byte_preview=None, refused=True
         )
 
-    return DecodedCommand(decoded_text=text, decode_error=None, truncated=truncated)
+    try:
+        raw_bytes = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        return DecodedCommand(decoded_text=None, decode_error="invalid base64", byte_preview=None)
+
+    if len(raw_bytes) > MAX_DECODED_BYTES:
+        return DecodedCommand(
+            decoded_text=None, decode_error=_REFUSED_MESSAGE, byte_preview=None, refused=True
+        )
+
+    try:
+        text = raw_bytes.decode("utf-16-le", errors="strict")
+    except UnicodeDecodeError:
+        preview = raw_bytes[:BYTE_PREVIEW_BYTES].hex()
+        return DecodedCommand(
+            decoded_text=None,
+            decode_error=f"not valid UTF-16LE; {len(raw_bytes)} bytes, first bytes {preview}",
+            byte_preview=preview,
+        )
+
+    return DecodedCommand(decoded_text=text, decode_error=None, byte_preview=None)
 
 
 def _describe_decode_result(decoded: DecodedCommand) -> str:
+    if decoded.refused:
+        return f"decode refused ({decoded.decode_error})"
     if decoded.decode_error is not None:
         return f"decode attempted, failed ({decoded.decode_error})"
 
     assert decoded.decoded_text is not None
-    truncation_note = " (decoding truncated at 64 KiB)" if decoded.truncated else ""
-
     preview = decoded.decoded_text[:DESCRIPTION_PREVIEW_CHARS]
     if len(decoded.decoded_text) > DESCRIPTION_PREVIEW_CHARS:
         preview += "...[preview truncated]"
 
-    return f"decoded successfully{truncation_note}: {preview}"
+    return f"decoded successfully: {preview}"
 
 
 def evaluate(events: tuple[NormalizedEvent, ...]) -> tuple[RuleMatch, ...]:
