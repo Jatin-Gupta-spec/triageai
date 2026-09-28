@@ -1,13 +1,35 @@
 """Correlates normalized events into Cases, then aggregates severity/
 confidence from each case's own deterministic rule matches.
 
-See this module's own inline design notes for the correlation
-algorithm (host as primary key, 24-hour case-boundary gap, undated
-events attach to a host's first case) -- this is this module's own
-documented interpretation, since the locked spec requires correlation
-"by host, user, source IP, and a documented time window" but does not
-itself define the grouping algorithm, same pattern as every rule's own
-detection heuristic.
+The locked spec requires correlation "by host, user, source IP, and a
+documented time window" but does not define the grouping algorithm.
+This module's documented interpretation:
+
+1. Identity key (Stage 17a):
+   - An event WITH a host is keyed by that host alone (case-
+     insensitive, Unicode-normalized; see identity.py).
+   - An event WITHOUT a host is keyed by the PAIR (user, source IP),
+     and only if BOTH are present.
+   - Anything else stays a single-event case.
+   A single weak identifier is never enough to join events: two
+   hostless events sharing only a user, or only an IP, stay separate.
+   Hostless events never attach to a host-based case.
+
+2. No identity chaining: because the key is an exact match on the
+   host, or on the (user, IP) pair, event A matching B and B matching
+   C never merges A and C unless they match each other directly.
+
+3. Time window: within one identity group, dated events are sorted
+   and a gap larger than CORRELATION_GAP (24 hours) between
+   consecutive events starts a new case. Consecutive events within
+   the gap do chain, so a long, steady stream stays one case.
+
+4. Undated events attach to the first case of their identity group,
+   since they cannot be placed in time.
+
+Known limitation: AUTH-001 requires a host, so hostless events that
+correlate by user+IP are grouped into a case but cannot match
+AUTH-001.
 """
 
 from __future__ import annotations
@@ -17,6 +39,7 @@ import itertools
 from collections import defaultdict
 from datetime import timedelta
 
+from triageai.identity import normalize_identity
 from triageai.models import Case, Confidence, NormalizedEvent, RuleMatch, Severity
 from triageai.rules import authentication, persistence, powershell
 
@@ -26,14 +49,23 @@ _RULES = (authentication.evaluate, powershell.evaluate, persistence.evaluate)
 
 
 def _case_id_for(events: tuple[NormalizedEvent, ...]) -> str:
-    """Deterministic case ID: SHA-256 over the sorted, joined record IDs.
-
-    Sorting first guarantees the same set of events always produces
-    the same case_id, independent of dict/iteration order -- required
-    for byte-identical determinism across runs.
-    """
+    """Deterministic case ID: SHA-256 over the sorted, joined record IDs."""
     joined = ",".join(sorted(event.original_record_id for event in events))
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def _identity_group_key(event: NormalizedEvent) -> tuple[str, ...] | None:
+    """Return the identity key for grouping, or None for a single-event case."""
+    host = normalize_identity(event.host)
+    if host is not None:
+        return ("host", host)
+
+    user = normalize_identity(event.user)
+    source_ip = normalize_identity(event.source_ip)
+    if user is not None and source_ip is not None:
+        return ("user-ip", user, source_ip)
+
+    return None
 
 
 def _split_by_time_gap(dated_events: list[NormalizedEvent]) -> list[list[NormalizedEvent]]:
@@ -61,9 +93,8 @@ def aggregate_severity_confidence(
     NOT the global max confidence across every match regardless of its
     severity. No matches = Informational / Low.
 
-    Exposed as a public, standalone function specifically so it can be
-    tested with synthetic RuleMatch fixtures independent of any real
-    rule firing, per the locked spec's test-plan requirement.
+    Public and standalone so it can be tested with synthetic
+    RuleMatch fixtures independent of any real rule firing.
     """
     if not rule_matches:
         return Severity.INFORMATIONAL, Confidence.LOW
@@ -76,8 +107,8 @@ def aggregate_severity_confidence(
 
 
 def _build_case(events: tuple[NormalizedEvent, ...]) -> Case:
-    hosts = tuple(sorted({e.host for e in events if e.host is not None}))
-    users = tuple(sorted({e.user for e in events if e.user is not None}))
+    hosts = tuple(sorted({e.host for e in events if e.host is not None and e.host.strip()}))
+    users = tuple(sorted({e.user for e in events if e.user is not None and e.user.strip()}))
     dated_timestamps = sorted(e.timestamp for e in events if e.timestamp is not None)
     undated_count = sum(1 for e in events if e.timestamp is None)
 
@@ -118,20 +149,19 @@ def build_cases(events: tuple[NormalizedEvent, ...]) -> tuple[Case, ...]:
     events, and aggregate severity/confidence. See module docstring
     for the grouping algorithm.
     """
-    by_host: dict[str | None, list[NormalizedEvent]] = defaultdict(list)
-    for event in events:
-        by_host[event.host].append(event)
-
+    by_identity: dict[tuple[str, ...], list[NormalizedEvent]] = defaultdict(list)
     cases: list[Case] = []
 
-    for host, host_events in by_host.items():
-        if host is None:
-            for event in host_events:
-                cases.append(_build_case((event,)))
-            continue
+    for event in events:
+        key = _identity_group_key(event)
+        if key is None:
+            cases.append(_build_case((event,)))
+        else:
+            by_identity[key].append(event)
 
-        dated = [e for e in host_events if e.timestamp is not None]
-        undated = tuple(e for e in host_events if e.timestamp is None)
+    for identity_events in by_identity.values():
+        dated = [e for e in identity_events if e.timestamp is not None]
+        undated = tuple(e for e in identity_events if e.timestamp is None)
 
         time_groups = _split_by_time_gap(dated)
 

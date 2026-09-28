@@ -34,6 +34,32 @@ def test_auth001_fixture_triggers_auth001(capsys: pytest.CaptureFixture[str]) ->
     assert "REJECTED" not in captured.out
 
 
+def test_auth001_bruteforce_fixture_reports_exactly_one_match(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The fixture has the same user AND the same source IP on all five
+    # events, so both AUTH-001 dimensions find the same event set.
+    # Stage 17a deduplicates that to a single match.
+    path = _FIXTURES / "suspicious" / "SC-AUTH001-bruteforce.json"
+    main(["analyze", str(path)])
+    captured = capsys.readouterr()
+
+    assert captured.out.count("  - AUTH-001") == 1
+
+
+def test_auth001_password_spray_fixture_is_detected_by_source_ip(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = _FIXTURES / "suspicious" / "SC-AUTH001-password-spray.json"
+    exit_code = main(["analyze", str(path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "AUTH-001" in captured.out
+    assert "ip:198.51.100.7" in captured.out
+    assert "REJECTED" not in captured.out
+
+
 def test_ps001_fixture_triggers_ps001(capsys: pytest.CaptureFixture[str]) -> None:
     path = _FIXTURES / "suspicious" / "SC-PS001-encoded-powershell.json"
     exit_code = main(["analyze", str(path)])
@@ -41,10 +67,6 @@ def test_ps001_fixture_triggers_ps001(capsys: pytest.CaptureFixture[str]) -> Non
 
     assert exit_code == 0
     assert "PS-001" in captured.out
-    # This will FAIL until the placeholder PAYLOAD_HERE in the fixture
-    # file is replaced with real base64 -- that's deliberate: it forces
-    # the fixture to actually demonstrate the decoded-content preview
-    # feature, not silently pass with broken input.
     assert "decoded successfully" in captured.out
     assert "REJECTED" not in captured.out
 

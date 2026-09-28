@@ -2,8 +2,8 @@
 locked severity/confidence aggregation rule.
 
 Aggregation is tested with synthetic RuleMatch fixtures, independent
-of any real rule firing, per the locked spec's test-plan requirement
-("Test aggregation separately... including ties and no matches").
+of any real rule firing. Stage 17a adds hostless user+IP correlation,
+the no-single-weak-identifier rule, and case-insensitive host grouping.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ def _event(
     *,
     host: str | None = None,
     user: str | None = None,
+    source_ip: str | None = None,
     timestamp: datetime | None = None,
     event_id: str | None = None,
 ) -> NormalizedEvent:
@@ -36,7 +37,7 @@ def _event(
         process=None,
         parent_process=None,
         command_line=None,
-        source_ip=None,
+        source_ip=source_ip,
         destination_ip=None,
         mitre_techniques=(),
     )
@@ -53,7 +54,7 @@ def _match(severity: Severity, confidence: Confidence) -> RuleMatch:
     )
 
 
-# --- build_cases: grouping ---
+# --- build_cases: host grouping ---
 
 
 def test_events_on_same_host_within_gap_form_one_case() -> None:
@@ -107,9 +108,26 @@ def test_build_cases_is_deterministic_across_runs() -> None:
     assert first == second
 
 
+def test_case_ids_are_independent_of_input_order() -> None:
+    e1 = _event("r1", host="H1", timestamp=_BASE)
+    e2 = _event("r2", host="H2", timestamp=_BASE)
+    e3 = _event("r3", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+
+    forward = [c.case_id for c in build_cases((e1, e2, e3))]
+    backward = [c.case_id for c in build_cases((e3, e2, e1))]
+
+    assert forward == backward
+
+
 def test_case_with_real_auth001_pattern_gets_matched_severity() -> None:
     events = tuple(
-        _event(f"r{i}", host="H1", user="alice", timestamp=_BASE + timedelta(minutes=i), event_id="4625")
+        _event(
+            f"r{i}",
+            host="H1",
+            user="alice",
+            timestamp=_BASE + timedelta(minutes=i),
+            event_id="4625",
+        )
         for i in range(5)
     )
 
@@ -121,11 +139,130 @@ def test_case_with_real_auth001_pattern_gets_matched_severity() -> None:
     assert cases[0].rule_matches[0].rule_id == "AUTH-001"
 
 
+def test_password_spray_case_is_scored_medium() -> None:
+    events = tuple(
+        _event(
+            f"r{i}",
+            host="H1",
+            user=f"user{i}",
+            source_ip="198.51.100.7",
+            timestamp=_BASE + timedelta(minutes=i),
+            event_id="4625",
+        )
+        for i in range(5)
+    )
+
+    cases = build_cases(events)
+
+    assert len(cases) == 1
+    assert cases[0].severity == Severity.MEDIUM
+    assert cases[0].rule_matches[0].rule_id == "AUTH-001"
+
+
 def test_case_with_no_matching_pattern_is_informational_low() -> None:
     cases = build_cases((_event("r1", host="H1", timestamp=_BASE),))
 
     assert cases[0].severity == Severity.INFORMATIONAL
     assert cases[0].confidence == Confidence.LOW
+
+
+# --- Stage 17a: case-insensitive host grouping and blank hosts ---
+
+
+def test_host_grouping_is_case_insensitive() -> None:
+    e1 = _event("r1", host="WIN-1", timestamp=_BASE)
+    e2 = _event("r2", host="win-1", timestamp=_BASE + timedelta(minutes=5))
+
+    cases = build_cases((e1, e2))
+
+    assert len(cases) == 1
+    assert cases[0].affected_hosts == ("WIN-1", "win-1")
+
+
+def test_blank_host_is_treated_as_hostless() -> None:
+    e1 = _event("r1", host="  ", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+    e2 = _event("r2", host="", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+
+    cases = build_cases((e1, e2))
+
+    assert len(cases) == 1
+    assert cases[0].affected_hosts == ()
+
+
+# --- Stage 17a: hostless correlation by user + source IP ---
+
+
+def test_hostless_events_with_same_user_and_ip_form_one_case() -> None:
+    e1 = _event("r1", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+    e2 = _event(
+        "r2", user="Alice", source_ip="10.0.0.5", timestamp=_BASE + timedelta(hours=1)
+    )
+
+    cases = build_cases((e1, e2))
+
+    assert len(cases) == 1
+    assert set(cases[0].normalized_events) == {e1, e2}
+
+
+def test_hostless_events_sharing_only_user_are_not_joined() -> None:
+    e1 = _event("r1", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+    e2 = _event("r2", user="alice", source_ip="10.0.0.6", timestamp=_BASE)
+
+    assert len(build_cases((e1, e2))) == 2
+
+
+def test_hostless_events_sharing_only_ip_are_not_joined() -> None:
+    e1 = _event("r1", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+    e2 = _event("r2", user="bob", source_ip="10.0.0.5", timestamp=_BASE)
+
+    assert len(build_cases((e1, e2))) == 2
+
+
+def test_hostless_events_missing_user_are_not_joined_even_with_same_ip() -> None:
+    e1 = _event("r1", source_ip="10.0.0.5", timestamp=_BASE)
+    e2 = _event("r2", source_ip="10.0.0.5", timestamp=_BASE)
+
+    assert len(build_cases((e1, e2))) == 2
+
+
+def test_hostless_events_never_attach_to_a_host_based_case() -> None:
+    with_host = _event("r1", host="H1", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+    hostless = _event("r2", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+
+    assert len(build_cases((with_host, hostless))) == 2
+
+
+def test_hostless_user_ip_group_splits_beyond_time_gap() -> None:
+    e1 = _event("r1", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+    e2 = _event(
+        "r2",
+        user="alice",
+        source_ip="10.0.0.5",
+        timestamp=_BASE + CORRELATION_GAP + timedelta(seconds=1),
+    )
+
+    assert len(build_cases((e1, e2))) == 2
+
+
+def test_hostless_undated_events_attach_to_first_case_in_user_ip_group() -> None:
+    dated = _event("r1", user="alice", source_ip="10.0.0.5", timestamp=_BASE)
+    undated = _event("r2", user="alice", source_ip="10.0.0.5", timestamp=None)
+
+    cases = build_cases((dated, undated))
+
+    assert len(cases) == 1
+    assert set(cases[0].normalized_events) == {dated, undated}
+
+
+def test_user_ip_links_do_not_chain_transitively() -> None:
+    # a and b share only the user, b and c share only the IP, a and c
+    # share nothing. Joining a-b-c through b would be exactly the
+    # weak-identifier chaining this design refuses.
+    a = _event("r1", user="alice", source_ip="10.0.0.1", timestamp=_BASE)
+    b = _event("r2", user="alice", source_ip="10.0.0.2", timestamp=_BASE)
+    c = _event("r3", user="bob", source_ip="10.0.0.2", timestamp=_BASE)
+
+    assert len(build_cases((a, b, c))) == 3
 
 
 # --- aggregate_severity_confidence: the locked formula, in isolation ---
@@ -153,9 +290,6 @@ def test_aggregate_takes_max_severity_across_matches() -> None:
 
 
 def test_aggregate_confidence_only_from_matches_at_max_severity() -> None:
-    # The key nuance the spec calls out: a lower-severity match's HIGH
-    # confidence must NOT leak into the result just because it's the
-    # highest confidence value present anywhere in the match set.
     severity, confidence = aggregate_severity_confidence(
         (_match(Severity.HIGH, Confidence.LOW), _match(Severity.MEDIUM, Confidence.HIGH))
     )
