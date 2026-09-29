@@ -1,8 +1,11 @@
 # TriageAI
 
 Offline-first, human-in-the-loop SOC triage assistant.
-
-**Status:** v0.1 complete — 15 stages built, tested, and acceptance-audited.
+**Status:** v0.1 feature-complete. An external security audit found 15 issues
+across redaction, deduplication, input parsing, report-output safety,
+correlation, and the AI trust boundary. 13 are fixed and covered by the test
+suite; one was a local packaging note outside this repository; this line was
+the last one. See LIMITATIONS.md for what remains open by design or by scope.
 
 ## What this is
 
