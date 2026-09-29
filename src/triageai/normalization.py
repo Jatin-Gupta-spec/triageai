@@ -28,18 +28,14 @@ def canonicalize(record: dict[str, Any]) -> bytes:
     by Unicode code point, array order is preserved, and the result is
     serialized as UTF-8 with no BOM, no insignificant whitespace,
     ensure_ascii=False. Non-finite floats are rejected by json.dumps's
-    default allow_nan=False -- the reader itself now also rejects
+    default allow_nan=False -- the reader itself also rejects
     NaN/Infinity at parse time (readers/wazuh_json.py), so this is
-    defense-in-depth, not the only line of defense.
+    defense-in-depth.
 
-    Fix: two DISTINCT raw keys can be Unicode-inequivalent before
-    normalization but become IDENTICAL after NFC normalization (e.g. a
-    composed "e-acute" codepoint vs. "e" + a combining acute accent).
-    Previously, _nfc_normalize's dict comprehension silently kept
-    whichever value happened to iterate last, discarding the other --
-    a real evidence-integrity violation, and one that could also cause
-    two genuinely DIFFERENT records to derive the SAME SHA-256 ID,
-    wrongly triggering deduplication. Now rejected outright.
+    Two DISTINCT raw keys can become IDENTICAL after NFC normalization
+    (e.g. a composed "e-acute" vs "e" + a combining acute accent).
+    Silently keeping only one would discard evidence, and could make
+    two different records derive the same ID, so it is rejected.
 
     Raises:
         TriageInputError: if two distinct object keys normalize to the
@@ -124,15 +120,18 @@ def _mitre_techniques_or_empty(value: Any) -> tuple[str, ...]:
 def normalize_event(raw_record: dict[str, Any]) -> NormalizedEvent:
     """Build a NormalizedEvent from one raw, decoded JSON object.
 
-    A supplied original_record_id is honored; otherwise it is derived
-    from the raw record before any of this normalization occurs. Field
-    extraction below reads directly from raw_record, NOT the
-    NFC-canonicalized form -- canonicalize() is invoked only for ID
-    derivation, so a record's observed field values always reflect
-    exactly what was supplied.
+    A supplied original_record_id is honored; otherwise the ID derived
+    from the raw record is used. Field extraction reads directly from
+    raw_record, NOT the NFC-canonicalized form, so observed field
+    values always reflect exactly what was supplied.
+
+    Stage 17d fix: canonicalization now ALWAYS runs, even when the
+    record supplies its own ID. Before, a record with a supplied ID
+    skipped the key-collision check entirely.
     """
+    canonical_id = derive_record_id(raw_record)
     supplied_id = raw_record.get("original_record_id")
-    record_id = supplied_id if isinstance(supplied_id, str) else derive_record_id(raw_record)
+    record_id = supplied_id if isinstance(supplied_id, str) else canonical_id
 
     return NormalizedEvent(
         original_record_id=record_id,
