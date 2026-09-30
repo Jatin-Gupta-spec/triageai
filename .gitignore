@@ -26,3 +26,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Scratch files from manual verification (see Stage 18 postmortem)
+/*.json
