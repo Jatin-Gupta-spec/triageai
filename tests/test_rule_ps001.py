@@ -1,6 +1,5 @@
-"""Tests for PS-001 -- positive, negative, boundary, and missing-field
-cases, per the locked spec's test requirements, plus (Stage 17c) the
-decode-size bounds and the bounded byte preview.
+"""Tests for PS-001 -- positive, negative, boundary, and
+missing-field cases, plus (Stage 18) exact-executable-token negatives.
 """
 
 from __future__ import annotations
@@ -52,9 +51,6 @@ def _encode_bytes(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
-# --- Positive ---
-
-
 def test_full_flag_with_valid_payload_matches() -> None:
     payload = _encode("Get-Process")
     event = _event(command_line=f"powershell.exe -EncodedCommand {payload}")
@@ -75,6 +71,9 @@ def test_abbreviated_flag_enc_matches() -> None:
 
 
 def test_command_line_only_mention_of_powershell_matches() -> None:
+    # cmd.exe /c powershell -- a genuine, common technique where the
+    # source SIEM may only ever log cmd.exe as the process, not the
+    # child powershell.exe.
     payload = _encode("Get-Process")
     event = _event(process=None, command_line=f"cmd.exe /c powershell -EncodedCommand {payload}")
 
@@ -88,9 +87,6 @@ def test_decoded_payload_content_appears_in_description() -> None:
     matches = evaluate((event,))
 
     assert "Get-Process" in matches[0].description
-
-
-# --- Negative ---
 
 
 def test_powershell_without_encoded_flag_does_not_match() -> None:
@@ -110,9 +106,6 @@ def test_excluded_short_abbreviation_e_does_not_match() -> None:
     assert evaluate((event,)) == ()
 
 
-# --- Boundary: the 64 KiB decode limit ---
-
-
 def test_decoded_output_at_exactly_max_bytes_is_accepted() -> None:
     text = "A" * (MAX_DECODED_BYTES // 2)
     result = decode_encoded_command(_encode(text))
@@ -125,8 +118,6 @@ def test_decoded_output_at_exactly_max_bytes_is_accepted() -> None:
 
 @pytest.mark.parametrize("extra_chars", [1, 2, 1000])
 def test_decoded_output_over_max_bytes_is_refused_not_truncated(extra_chars: int) -> None:
-    # extra_chars=1 is exactly two bytes over the limit and still passes
-    # the cheap length check, so it exercises the exact post-decode check.
     text = "A" * ((MAX_DECODED_BYTES // 2) + extra_chars)
     result = decode_encoded_command(_encode(text))
 
@@ -165,9 +156,6 @@ def test_shortest_accepted_abbreviation_enc_matches() -> None:
     assert len(evaluate((event,))) == 1
 
 
-# --- Failure handling: only a short, fixed-wording record is kept ---
-
-
 def test_invalid_base64_records_a_fixed_error() -> None:
     payload = "not-valid-base64!!!"
     result = decode_encoded_command(payload)
@@ -179,7 +167,7 @@ def test_invalid_base64_records_a_fixed_error() -> None:
 
 
 def test_utf16_failure_keeps_only_a_short_hex_preview() -> None:
-    raw = b"\x00\xd8" * 50  # 100 bytes; a lone surrogate is invalid UTF-16LE
+    raw = b"\x00\xd8" * 50
     result = decode_encoded_command(_encode_bytes(raw))
 
     assert result.decoded_text is None
@@ -195,9 +183,6 @@ def test_odd_length_bytes_fail_utf16_with_preview() -> None:
 
     assert result.decoded_text is None
     assert result.byte_preview == "6f6464"
-
-
-# --- Missing-field ---
 
 
 def test_command_line_none_does_not_crash_or_match() -> None:
@@ -233,3 +218,39 @@ def test_valid_base64_but_not_utf16le_still_matches_with_decode_error() -> None:
 
 def test_empty_input_produces_no_matches() -> None:
     assert evaluate(()) == ()
+
+
+# --- Stage 18: exact executable, not "mentioned anywhere" ---
+
+
+def test_echo_mentioning_powershell_does_not_match() -> None:
+    payload = _encode("Get-Process")
+    event = _event(process=None, command_line=f"cmd.exe /c echo powershell -enc {payload}")
+    assert evaluate((event,)) == ()
+
+
+def test_text_mentioning_powershell_enc_does_not_match() -> None:
+    payload = _encode("Get-Process")
+    event = _event(
+        process=None,
+        command_line=f"notepad.exe message.txt saying powershell -enc {payload} is bad",
+    )
+    assert evaluate((event,)) == ()
+
+
+def test_misleadingly_named_executable_does_not_match() -> None:
+    payload = _encode("Get-Process")
+    event = _event(process=None, command_line=f"not-powershell.exe -enc {payload}")
+    assert evaluate((event,)) == ()
+
+
+def test_misleadingly_named_process_field_does_not_match() -> None:
+    payload = _encode("Get-Process")
+    event = _event(process="not-powershell.exe", command_line=f"not-powershell.exe -enc {payload}")
+    assert evaluate((event,)) == ()
+
+
+def test_dash_c_subcommand_flag_still_recognizes_powershell() -> None:
+    payload = _encode("Get-Process")
+    event = _event(process=None, command_line=f"pwsh -c powershell -enc {payload}")
+    assert len(evaluate((event,))) == 1

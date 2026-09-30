@@ -64,6 +64,12 @@ def test_terminal_encodes_zero_width_and_bom_characters() -> None:
     assert "\\ufeff" in result
 
 
+def test_terminal_does_not_html_escape() -> None:
+    # Terminal output is plain text, not markup -- & < > must survive
+    # untouched, unlike the markdown path.
+    assert sanitize_for_terminal("Tom & Jerry <b>bold</b>") == "Tom & Jerry <b>bold</b>"
+
+
 def test_markdown_escapes_pipe() -> None:
     result = sanitize_for_markdown_cell("value | fake_column | injected")
     assert result == "value \\| fake_column \\| injected"
@@ -90,3 +96,44 @@ def test_markdown_encodes_bidi_override_visibly() -> None:
     result = sanitize_for_markdown_cell("admin\u202enimda")
     assert "\u202e" not in result
     assert "\\u202e" in result
+
+
+# --- Stage 18: HTML escaping ---
+
+
+def test_markdown_escapes_ampersand() -> None:
+    assert sanitize_for_markdown_cell("Tom & Jerry") == "Tom &amp; Jerry"
+
+
+def test_markdown_escapes_script_tag() -> None:
+    result = sanitize_for_markdown_cell("<script>alert(1)</script>")
+    assert "<script>" not in result
+    assert "&lt;script&gt;" in result
+
+
+def test_markdown_escapes_img_onerror() -> None:
+    result = sanitize_for_markdown_cell("<img src=x onerror=alert(1)>")
+    assert "<img" not in result
+    assert "&lt;img" in result
+
+
+def test_markdown_escapes_html_comment() -> None:
+    result = sanitize_for_markdown_cell("<!-- comment -->")
+    assert "<!--" not in result
+    assert "&lt;!--" in result
+
+
+def test_markdown_own_br_insertion_stays_raw_and_unescaped() -> None:
+    # The <br> WE insert for a line break must remain literal HTML,
+    # not get caught by the escaping step -- escaping happens before
+    # the <br> is inserted, never after.
+    result = sanitize_for_markdown_cell("line1\nline2")
+    assert "<br>" in result
+    assert "&lt;br&gt;" not in result
+
+
+def test_markdown_escapes_ampersand_that_would_otherwise_form_an_entity() -> None:
+    # Confirms escaping doesn't double-escape: a literal "&amp;" typed
+    # by an attacker becomes "&amp;amp;", not silently collapsed back
+    # into a real entity.
+    assert sanitize_for_markdown_cell("&amp;") == "&amp;amp;"

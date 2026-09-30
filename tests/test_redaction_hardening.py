@@ -191,3 +191,15 @@ def test_unseeded_email_in_command_line_does_not_crash_redaction() -> None:
     aliaser = EmailAliaser(["alice@corp.local"])
     redacted = redact_event_for_render(event, aliaser)
     assert redacted.command_line == "notify [REDACTED_EMAIL]"
+
+def test_windows_user_path_with_space_is_redacted() -> None:
+    result = redact_free_text(r"C:\Users\John Smith\AppData\evil.exe")
+    assert result == r"C:\Users\[REDACTED_USER]\AppData\evil.exe"
+
+
+def test_windows_user_path_with_space_and_no_trailing_segment_is_redacted() -> None:
+    assert redact_free_text(r"C:\Users\John Smith") == r"C:\Users\[REDACTED_USER]"
+
+
+def test_posix_home_path_with_space_is_redacted() -> None:
+    assert redact_free_text("/home/John Smith/.bashrc") == "/home/[REDACTED_USER]/.bashrc"

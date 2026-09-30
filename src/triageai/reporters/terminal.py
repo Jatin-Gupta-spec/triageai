@@ -1,24 +1,17 @@
 """Plain-text report rendering. Renders REDACTED copies only -- callers
 are responsible for passing already-redacted cases (see redaction.py).
-
-Fix: every untrusted field is now sanitized via render_safety.py
-before being embedded in output. Previously, only the AI-prompt path
-(prompt_builder.py) stripped control characters -- this exact terminal
-report path was left completely unprotected, letting an untrusted
-hostname or command_line containing raw ANSI escape sequences
-manipulate the terminal's display when printed.
 """
 
 from __future__ import annotations
 
-from triageai.models import AIAnalysisDraft, Case
+from triageai.models import AIDraftOutcome, Case
 from triageai.render_safety import sanitize_for_terminal
 from triageai.reporters.timeline import build_timeline
 
 
-def render_text(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraft | None]) -> str:
+def render_text(cases: tuple[Case, ...], ai_drafts: dict[str, AIDraftOutcome]) -> str:
     """Render one section per case: severity/confidence, rule matches,
-    evidence gaps, observed facts, AI draft (or rejection notice), then
+    evidence gaps, observed facts, AI draft (or rejection reason), then
     a sorted event timeline.
     """
     if not cases:
@@ -53,15 +46,25 @@ def render_text(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraft | 
             lines.append("Observed facts:")
             lines.extend(f"  - {sanitize_for_terminal(fact)}" for fact in case.observed_facts)
 
-        draft = ai_drafts.get(case.case_id)
+        outcome = ai_drafts.get(case.case_id)
         lines.append("AI draft:")
-        if draft is None:
+        if outcome is None or outcome.draft is None:
+            # outcome.rejection_reason is typed str | None -- nothing
+            # at the type level guarantees it's set whenever draft is
+            # None, even though every real construction in cli.py does
+            # set it. Fall back to a fixed, safe string rather than
+            # ever passing None where a str is required.
+            reason = (
+                outcome.rejection_reason
+                if outcome is not None and outcome.rejection_reason is not None
+                else "no draft was generated"
+            )
             lines.append(
-                "  [REJECTED -- the AI provider's output failed schema or evidence "
-                "validation and has been withheld. The deterministic evidence above "
-                "is unaffected.]"
+                f"  [REJECTED -- {sanitize_for_terminal(reason)}. The deterministic "
+                "evidence above is unaffected.]"
             )
         else:
+            draft = outcome.draft
             lines.append(f"  Summary: {sanitize_for_terminal(draft.summary)}")
             for obs in draft.observations:
                 lines.append(f"  - Observation: {sanitize_for_terminal(obs)}")
@@ -71,6 +74,12 @@ def render_text(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraft | 
                 lines.append(f"  - Possible false positive: {sanitize_for_terminal(fp)}")
             for step in draft.recommended_next_steps:
                 lines.append(f"  - Recommended next step: {sanitize_for_terminal(step)}")
+            for gap in draft.evidence_gaps:
+                lines.append(
+                    f"  - AI-proposed evidence gap (unverified): {sanitize_for_terminal(gap)}"
+                )
+            for claim in draft.unsupported_claims:
+                lines.append(f"  - AI-flagged unsupported claim: {sanitize_for_terminal(claim)}")
             lines.append(f"  [{sanitize_for_terminal(draft.analyst_warning)}]")
 
         lines.append("Timeline:")
@@ -81,9 +90,7 @@ def render_text(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraft | 
             event_id = sanitize_for_terminal(event.event_id) if event.event_id is not None else "?"
             process = sanitize_for_terminal(event.process) if event.process is not None else "?"
             command_line = (
-                sanitize_for_terminal(event.command_line)
-                if event.command_line is not None
-                else "?"
+                sanitize_for_terminal(event.command_line) if event.command_line is not None else "?"
             )
             lines.append(
                 f"  [{when}] host={host} user={user} "

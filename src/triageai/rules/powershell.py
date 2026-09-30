@@ -3,45 +3,36 @@
 Locked default (spec Section 7): Medium severity / Medium confidence,
 mapped to MITRE T1059.001. Detects the PRESENCE of an -EncodedCommand
 style flag in a PowerShell invocation -- NOT whether the encoded
-payload is actually malicious. Per the spec: "Encoding is not
-automatically malicious."
+payload is actually malicious.
 
-Detection heuristic (this rule's own documented interpretation, not
-spec-locked): an event is a candidate PowerShell invocation if its
-`process` field names powershell.exe or pwsh.exe, OR its
-`command_line` mentions either interpreter by name. Within a candidate
-event, the rule fires if `command_line` contains a whitespace-
-delimited flag token matching a known -EncodedCommand abbreviation
-(`-enc` through the full `-encodedcommand`, case-insensitive). Bare
-`-e` / `-en` are deliberately EXCLUDED -- ambiguous with unrelated
-tools' flags.
+Stage 18 fix to the executable-detection heuristic: previously
+checked whether the SUBSTRING "powershell" (or "pwsh") appeared
+anywhere in process or command_line. That wrongly matched text that
+only PRINTS the word (cmd.exe /c echo powershell -enc AAAA), or an
+unrelated executable whose name happens to contain it
+(not-powershell.exe). The rule now requires one of:
+  (a) `process`'s own basename (command_line.py) is exactly
+      powershell(.exe) or pwsh(.exe);
+  (b) the FIRST token of command_line has that basename; or
+  (c) a token immediately following a known "run a sub-command" flag
+      (/c, /k from cmd.exe; -c, -Command from a POSIX shell or
+      PowerShell itself) has that basename -- this is what still
+      recognizes `cmd.exe /c powershell -EncodedCommand ...`, a
+      genuine and common technique, while (a)/(b) alone would miss it
+      since the actual PowerShell process may never be separately
+      logged by the source SIEM.
 
 Decoding is opportunistic evidence enrichment, not a precondition to
-fire. Stage 17c makes the locked decode bounds real:
-- ONE base64 decode, never recursive, never executed.
-- A payload whose text is longer than MAX_ENCODED_CHARS cannot fit in
-  MAX_DECODED_BYTES, so it is REFUSED before the decoder runs. A
-  shorter payload can decode to at most about 64 KiB, and the exact
-  MAX_DECODED_BYTES limit is checked right after. An oversized payload
-  is refused, not truncated: no decoded text is retained. (The 5 MiB
-  input-file cap already bounded the old behaviour to a few MB, so
-  this was a contract violation more than an attack.)
-- The bytes are interpreted as strict UTF-16LE, which is how
-  PowerShell encodes them before base64.
-- On a UTF-16LE failure only a short hex preview of the first
-  BYTE_PREVIEW_BYTES bytes and the byte count are kept, never the
-  decoded bytes as text. Error texts are fixed wording, not copies of
-  an exception message.
+fire. Single-pass, never recursive, capped at 64 KiB, refused (not
+truncated) if the payload could exceed that before decoding, bytes
+interpreted as strict UTF-16LE, a failure keeps only a 16-byte hex
+preview and byte count. See DESCRIPTION_PREVIEW_CHARS for the
+successful-decode preview shown in the match description.
 
-A bounded preview of successfully decoded text (up to
-DESCRIPTION_PREVIEW_CHARS) is included in the RuleMatch description.
-It passes through redaction at render time, which scrubs secret
-patterns in rule descriptions.
-
-Known, still-open item: RuleMatch.description embeds plain
-(non-email-shaped) hostnames directly. Per redaction.py's documented
-scope decision, a bare hostname is not itself redacted anywhere in
-this project yet; see LIMITATIONS.md.
+Known, cross-cutting, still-open item: RuleMatch.description embeds
+plain (non-email-shaped) hostnames directly. Per redaction.py's
+documented scope decision, a bare hostname is not itself redacted
+anywhere in this project yet; see LIMITATIONS.md.
 """
 
 from __future__ import annotations
@@ -49,21 +40,22 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass
+from itertools import pairwise
 
+from triageai.command_line import basename
 from triageai.models import Confidence, NormalizedEvent, RuleMatch, Severity
 
 RULE_ID = "PS-001"
 MITRE_TECHNIQUE = "T1059.001"
 MAX_DECODED_BYTES = 64 * 1024
-# Longest base64 text that can still decode to MAX_DECODED_BYTES bytes:
-# 4 characters per 3 bytes, rounded up to whole 4-character groups.
 MAX_ENCODED_CHARS = ((MAX_DECODED_BYTES + 2) // 3) * 4
 BYTE_PREVIEW_BYTES = 16
 DESCRIPTION_PREVIEW_CHARS = 300
 
 _REFUSED_MESSAGE = "encoded payload is longer than the 64 KiB decode limit allows"
 
-_POWERSHELL_PROCESS_NAMES = ("powershell.exe", "pwsh.exe")
+_POWERSHELL_EXECUTABLE_NAMES = frozenset({"powershell.exe", "powershell", "pwsh.exe", "pwsh"})
+_SUBCOMMAND_FLAGS = frozenset({"/c", "/k", "-c", "-command"})
 _ENCODED_COMMAND_FLAGS = frozenset(
     {
         "-enc",
@@ -84,13 +76,7 @@ _ENCODED_COMMAND_FLAGS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class DecodedCommand:
-    """Result of attempting to decode one -EncodedCommand payload.
-
-    Exactly one of these holds: decoded_text is set (success);
-    refused is True (payload over the size limit, decoder not
-    trusted with it); or decode_error is set (invalid base64 or not
-    UTF-16LE). byte_preview is set only for a UTF-16LE failure.
-    """
+    """Result of attempting to decode one -EncodedCommand payload."""
 
     decoded_text: str | None
     decode_error: str | None
@@ -99,11 +85,25 @@ class DecodedCommand:
 
 
 def _is_powershell_event(event: NormalizedEvent) -> bool:
-    process = (event.process or "").lower()
-    command_line = (event.command_line or "").lower()
-    if any(process.endswith(name) for name in _POWERSHELL_PROCESS_NAMES):
+    if event.process is not None and basename(event.process) in _POWERSHELL_EXECUTABLE_NAMES:
         return True
-    return any(name.removesuffix(".exe") in command_line for name in _POWERSHELL_PROCESS_NAMES)
+
+    command_line = event.command_line
+    if command_line is None:
+        return False
+
+    tokens = command_line.split()
+    if not tokens:
+        return False
+
+    if basename(tokens[0]) in _POWERSHELL_EXECUTABLE_NAMES:
+        return True
+
+    for previous, current in pairwise(tokens):
+        if previous.lower() in _SUBCOMMAND_FLAGS and basename(current) in _POWERSHELL_EXECUTABLE_NAMES:
+            return True
+
+    return False
 
 
 def _has_encoded_flag(command_line: str) -> bool:
@@ -111,7 +111,6 @@ def _has_encoded_flag(command_line: str) -> bool:
 
 
 def _find_encoded_payload(command_line: str) -> str | None:
-    """Return the base64 payload following a recognized flag, or None."""
     tokens = command_line.split()
     for index, token in enumerate(tokens):
         if token.lower() in _ENCODED_COMMAND_FLAGS and index + 1 < len(tokens):
@@ -120,12 +119,7 @@ def _find_encoded_payload(command_line: str) -> str | None:
 
 
 def decode_encoded_command(payload: str) -> DecodedCommand:
-    """Single-pass, bounded, inert decode of one base64 -EncodedCommand payload.
-
-    Never executed, never recursively decoded. The size limit is
-    enforced before the decoder runs (see the module docstring), so
-    the decoder is never handed a payload that could exceed it.
-    """
+    """Single-pass, bounded, inert decode of one base64 -EncodedCommand payload."""
     if len(payload) > MAX_ENCODED_CHARS:
         return DecodedCommand(
             decoded_text=None, decode_error=_REFUSED_MESSAGE, byte_preview=None, refused=True
@@ -169,7 +163,6 @@ def _describe_decode_result(decoded: DecodedCommand) -> str:
 
 
 def evaluate(events: tuple[NormalizedEvent, ...]) -> tuple[RuleMatch, ...]:
-    """Flag every PowerShell invocation carrying an -EncodedCommand-style flag."""
     matches: list[RuleMatch] = []
 
     for event in events:

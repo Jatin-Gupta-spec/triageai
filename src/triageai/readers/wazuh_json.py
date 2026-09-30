@@ -1,26 +1,26 @@
 """Safe, deterministic reading of sanitized Wazuh-style JSON input.
 
-This module turns bytes on disk into raw, decoded JSON values. It
-performs NO event-shape validation and NO rule evaluation -- only:
-size limits, encoding rules, duplicate-key rejection, non-finite
-numeric constant rejection, link-safe traversal, and the per-analysis
-record cap. Normalization into NormalizedEvent happens in
-normalization.py.
+Stage 18 link policy, extending Stage 17c:
+- The input path's own PARENT DIRECTORIES are now also checked. Before
+  this, `analyze linked-parent/real-file.json` would pass, because
+  only the final path component was checked, even though the
+  directory it sits inside was reached through a link.
+- The read itself now takes a small extra step to reduce, not fully
+  close, the gap between checking a path and opening it: on platforms
+  that support it (POSIX), the file is opened with O_NOFOLLOW, so the
+  OS itself refuses to follow a symlink swapped in at the very last
+  moment; and the identity (device + inode) of the file actually
+  opened is compared against the identity seen by the earlier stat --
+  a mismatch means the path was swapped between the check and the
+  open, and the read is refused.
 
-Stage 17c link policy. The locked spec says "do not follow symlinks or
-Windows junctions". A path is treated as a link (_is_link_like) if it
-is a symbolic link, a Windows junction, or a Windows reparse point
-whose tag is symlink or mount point. Other reparse points, such as
-OneDrive cloud placeholders, are ordinary files and are read.
-- The input path itself: rejected with an error (exit code 2). Before
-  this, a symlink given directly on the command line was followed.
-- Files inside a scanned directory: skipped and counted.
-- Directories inside a scanned directory: not descended into.
-
-Documented limits (also in LIMITATIONS.md): only the final path
-component and entries found during a scan are checked, not parent
-folders of the input path; the check happens before the read, so a
-link swapped in between is not caught.
+Documented limits (also in LIMITATIONS.md): the ancestor check does
+not resolve ".." segments in the input path, since resolving would
+mean following symlinks along the way, defeating the point; a plain
+path with no ".." is unaffected. st_ino/st_dev identity comparison is
+well-established on POSIX; its behavior on Windows for this exact
+scenario has not been independently verified beyond what this
+project's own tests exercise.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import NoReturn
+from typing import IO, NoReturn
 
 from triageai.errors import TriageInputError
 
@@ -44,9 +44,6 @@ _UTF_BOMS: tuple[bytes, ...] = (
     b"\xef\xbb\xbf",      # UTF-8
 )
 
-# Windows reparse tags that make a path a link: symlink and mount point
-# (a directory junction). Defined here so the code type-checks and runs
-# the same on every platform.
 _LINK_REPARSE_TAGS = frozenset({0xA000000C, 0xA0000003})
 
 
@@ -86,19 +83,44 @@ def _is_link_like(path: Path) -> bool:
     return bool(is_junction is not None and is_junction(path))
 
 
+def _has_linked_ancestor(path: Path) -> bool:
+    """True if any PARENT directory of `path` is itself a link.
+
+    Uses .absolute() (prefixes cwd if relative) rather than .resolve()
+    (which follows symlinks and would defeat the point of this check).
+    A ".." segment in the input path is not collapsed, so this check
+    only reliably covers a plain path with no ".." components.
+    """
+    return any(_is_link_like(parent) for parent in path.absolute().parents)
+
+
+def _open_without_following_symlink(path: Path) -> IO[bytes]:
+    """Open `path` for reading, refusing to follow a symlink at the
+    final path component where the platform supports that (POSIX's
+    O_NOFOLLOW). No equivalent flag is used on Windows here; the
+    caller's identity comparison is the defense on that platform.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_descriptor = os.open(path, flags)
+    return os.fdopen(file_descriptor, "rb")
+
+
 def read_input(path: Path) -> ReadResult:
     """Read one JSON file, or every .json file in a directory tree.
 
     Raises:
-        TriageInputError: for an input path that is a symlink or
-            junction, a missing path, an oversized file, a BOM or
-            encoding violation, malformed JSON, a duplicate object
-            key, a non-finite numeric constant, or if the per-analysis
-            record cap would be exceeded.
+        TriageInputError: for an input path (or any of its parent
+            directories) that is a symlink or junction, a missing
+            path, an oversized file, a BOM or encoding violation,
+            malformed JSON, a duplicate object key, a non-finite
+            numeric constant, a file whose identity changed between
+            the size check and the read, or if the per-analysis record
+            cap would be exceeded.
     """
-    if _is_link_like(path):
+    if _is_link_like(path) or _has_linked_ancestor(path):
         raise TriageInputError(
-            f"input path is a symbolic link or junction; refusing to follow it: {path}"
+            f"input path is, or is reached through, a symbolic link or junction; "
+            f"refusing to follow it: {path}"
         )
     if path.is_dir():
         return _read_directory(path)
@@ -174,16 +196,31 @@ def _read_single_file(path: Path, running_total: int = 0) -> ReadResult:
 
 def _read_bounded_bytes(path: Path) -> bytes:
     try:
-        stat_result = path.stat()
+        pre_open_stat = path.stat()
     except OSError as exc:
         raise TriageInputError(f"cannot stat {path}: {exc}") from exc
 
-    if stat_result.st_size > MAX_FILE_BYTES:
+    if pre_open_stat.st_size > MAX_FILE_BYTES:
         raise TriageInputError(
-            f"{path}: {stat_result.st_size:,} bytes exceeds the {MAX_FILE_BYTES:,}-byte limit"
+            f"{path}: {pre_open_stat.st_size:,} bytes exceeds the {MAX_FILE_BYTES:,}-byte limit"
         )
 
-    with path.open("rb") as handle:
+    try:
+        handle = _open_without_following_symlink(path)
+    except OSError as exc:
+        raise TriageInputError(f"cannot open {path}: {exc}") from exc
+
+    with handle:
+        post_open_stat = os.fstat(handle.fileno())
+        if (post_open_stat.st_dev, post_open_stat.st_ino) != (
+            pre_open_stat.st_dev,
+            pre_open_stat.st_ino,
+        ):
+            raise TriageInputError(
+                f"{path}: file identity changed between the size check and the read; "
+                "refusing to process"
+            )
+
         data = handle.read(MAX_FILE_BYTES + 1)
 
     if len(data) > MAX_FILE_BYTES:
@@ -220,7 +257,7 @@ def _reject_non_finite_constant(constant: str) -> NoReturn:
     """Callback for json.loads's parse_constant hook.
 
     Python's json module accepts NaN, Infinity and -Infinity by
-    default. Rejecting them here, at the earliest point, keeps a
-    non-finite float from reaching canonicalize() and crashing there.
+    default. Rejecting them here keeps a non-finite float from
+    reaching canonicalize() and crashing there.
     """
     raise ValueError(f"non-finite numeric constant not allowed in JSON: {constant}")

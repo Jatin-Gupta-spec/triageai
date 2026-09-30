@@ -15,7 +15,7 @@ from pathlib import Path
 from triageai.correlation import build_cases
 from triageai.errors import TriageInputError
 from triageai.hallucination_check import HallucinationError, check_for_hallucination
-from triageai.models import AIAnalysisDraft, Case, NormalizedEvent, ScanSummary
+from triageai.models import AIDraftOutcome, Case, NormalizedEvent, ScanSummary
 from triageai.normalization import normalize_event
 from triageai.output_validation import OutputValidationError, validate_ai_output
 from triageai.prompt_builder import build_prompt
@@ -25,6 +25,14 @@ from triageai.readers.wazuh_json import RawRecord, read_input
 from triageai.redaction import redact_case_for_render
 from triageai.reporters.markdown_report import render_markdown
 from triageai.reporters.terminal import render_text
+
+# Fixed, short rejection-reason strings -- NEVER raw provider text.
+# A rendered report shows exactly one of these, so a misbehaving or
+# compromised provider can never inject arbitrary text through a
+# rejection message.
+REJECTION_PROVIDER_ERROR = "the AI provider could not produce output"
+REJECTION_SCHEMA_INVALID = "the AI provider's output failed schema validation"
+REJECTION_UNSUPPORTED_CLAIM = "the AI draft contained a claim not supported by this case's evidence"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -87,11 +95,12 @@ def _normalize_records(raw_records: tuple[RawRecord, ...]) -> _NormalizationResu
 
 def _generate_validated_draft(
     redacted_case: Case, provider: AIProvider | None = None
-) -> AIAnalysisDraft | None:
+) -> AIDraftOutcome:
     """Run the full AI pipeline for one case: build the prompt, ask the
-    provider, validate shape, validate content. Returns None if the
-    provider fails or EITHER validation layer rejects the draft -- per
-    the locked spec's fail-closed rule.
+    provider, validate shape, validate content. Returns a rejection
+    outcome, with a fixed reason string, if the provider fails or
+    EITHER validation layer rejects the draft -- per the locked spec's
+    fail-closed rule.
 
     `provider` exists so tests can exercise the rejection paths with a
     misbehaving provider. The CLI itself always uses the default mock;
@@ -103,19 +112,19 @@ def _generate_validated_draft(
     try:
         raw_text = active_provider.generate(prompt)
     except ProviderError:
-        return None
+        return AIDraftOutcome(draft=None, rejection_reason=REJECTION_PROVIDER_ERROR)
 
     try:
         draft = validate_ai_output(raw_text)
     except OutputValidationError:
-        return None
+        return AIDraftOutcome(draft=None, rejection_reason=REJECTION_SCHEMA_INVALID)
 
     try:
         check_for_hallucination(draft, redacted_case)
     except HallucinationError:
-        return None
+        return AIDraftOutcome(draft=None, rejection_reason=REJECTION_UNSUPPORTED_CLAIM)
 
-    return draft
+    return AIDraftOutcome(draft=draft)
 
 
 def _format_scan_summary(summary: ScanSummary) -> str:
@@ -165,7 +174,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cases=cases,
     )
 
-    ai_drafts: dict[str, AIAnalysisDraft | None] = {
+    ai_drafts: dict[str, AIDraftOutcome] = {
         case.case_id: _generate_validated_draft(case) for case in redacted_cases
     }
 

@@ -88,8 +88,12 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 # and replaces only the account name. \x22 and \x27 are the two quote
 # characters.
 _PATH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?i)(\b[a-z]:[\\/]users[\\/])[^\\/\s\x22\x27]+"), r"\1[REDACTED_USER]"),
-    (re.compile(r"(/(?:home|Users)/)[^/\s\x22\x27]+"), r"\1[REDACTED_USER]"),
+    # [^...] excludes path separators, quotes, and control characters
+    # -- but NOT plain whitespace, so an NTFS folder name containing a
+    # real space (e.g. "John Smith") is matched in full rather than
+    # cut off at the first space (Stage 18 fix).
+    (re.compile(r"(?i)(\b[a-z]:[\\/]users[\\/])[^\\/\x22\x27\x00-\x1f]+"), r"\1[REDACTED_USER]"),
+    (re.compile(r"(/(?:home|Users)/)[^/\x22\x27\x00-\x1f]+"), r"\1[REDACTED_USER]"),
 )
 
 # Key names (not string content) that mark an entire value as

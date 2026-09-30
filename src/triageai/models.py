@@ -141,3 +141,23 @@ class ScanSummary:
     duplicate_count: int
     undated_count: int
     cases: tuple[Case, ...]
+
+@dataclass(frozen=True, slots=True)
+class AIDraftOutcome:
+    """The result of one case's AI draft pipeline: either an accepted,
+    validated draft, or a rejection with a short, fixed-wording reason.
+
+    This is not observed evidence -- it is the shared contract between
+    cli.py (which runs the pipeline) and the reporters (which render
+    its result), which is why it lives alongside the evidence models
+    rather than inside cli.py or a reporter module.
+
+    `rejection_reason`, when present, is always one of a small set of
+    fixed, short strings (see cli.py's REJECTION_* constants) -- never
+    raw provider output, so a misbehaving or compromised provider can
+    never inject arbitrary text into a rendered report through this
+    field.
+    """
+
+    draft: AIAnalysisDraft | None
+    rejection_reason: str | None = None

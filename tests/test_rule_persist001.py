@@ -1,6 +1,6 @@
 """Tests for PERSIST-001 -- positive, negative, boundary, and
 missing-field cases, plus the spec-required legitimate-administration
-fixture.
+fixture and (Stage 18) exact-executable-token negative cases.
 """
 
 from __future__ import annotations
@@ -34,9 +34,6 @@ def _event(
     )
 
 
-# --- Positive ---
-
-
 def test_event_id_4698_alone_matches() -> None:
     event = _event(event_id="4698")
     matches = evaluate((event,))
@@ -60,14 +57,20 @@ def test_uppercase_create_flag_matches() -> None:
     assert len(evaluate((event,))) == 1
 
 
-# --- The spec-required negative case: legitimate administration ---
+def test_full_path_to_schtasks_matches() -> None:
+    event = _event(command_line=r'C:\Windows\System32\schtasks.exe /create /tn "Foo"')
+    assert len(evaluate((event,))) == 1
+
+
+def test_quoted_schtasks_path_matches() -> None:
+    event = _event(command_line=r'"C:\Windows\System32\schtasks.exe" /create /tn "Foo"')
+    assert len(evaluate((event,))) == 1
 
 
 def test_legitimate_administrative_task_still_matches() -> None:
     # Per spec Section 7: "Legitimate administration is a required
     # negative case" -- this rule detects the ACTION, not intent, and
-    # MUST still fire here. The analyst reviewing the case decides
-    # this is benign; the rule's job is only to surface the pattern.
+    # MUST still fire here.
     event = _event(
         command_line=(
             r'schtasks.exe /create /tn "Windows Update Check" '
@@ -79,9 +82,6 @@ def test_legitimate_administrative_task_still_matches() -> None:
 
     assert len(matches) == 1
     assert "does not indicate malicious intent" in matches[0].description
-
-
-# --- Negative ---
 
 
 def test_schtasks_query_does_not_match() -> None:
@@ -99,12 +99,7 @@ def test_unrelated_event_does_not_match() -> None:
     assert evaluate((event,)) == ()
 
 
-# --- Boundary ---
-
-
 def test_create_as_substring_of_another_flag_does_not_match() -> None:
-    # Guards against accidental substring matching -- only an exact
-    # "/create" token counts, not a flag that merely contains it.
     event = _event(command_line='schtasks.exe /createlike /tn "Foo"')
     assert evaluate((event,)) == ()
 
@@ -114,7 +109,27 @@ def test_schtasks_mentioned_without_create_flag_does_not_match() -> None:
     assert evaluate((event,)) == ()
 
 
-# --- Missing-field ---
+# --- Stage 18: exact executable token, not "mentioned anywhere" ---
+
+
+def test_echo_of_schtasks_create_does_not_match() -> None:
+    event = _event(command_line="echo schtasks /create")
+    assert evaluate((event,)) == ()
+
+
+def test_similarly_named_tool_does_not_match() -> None:
+    event = _event(command_line="not-schtasks-tool /create")
+    assert evaluate((event,)) == ()
+
+
+def test_schtasks_backup_exe_does_not_match() -> None:
+    event = _event(command_line="schtasks-backup.exe /create")
+    assert evaluate((event,)) == ()
+
+
+def test_message_mentioning_schtasks_create_in_a_string_does_not_match() -> None:
+    event = _event(command_line='notepad.exe "note about schtasks /create usage"')
+    assert evaluate((event,)) == ()
 
 
 def test_command_line_none_and_no_event_id_does_not_crash_or_match() -> None:

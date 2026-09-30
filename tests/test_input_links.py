@@ -167,3 +167,26 @@ def test_junction_inside_a_directory_is_not_descended(tmp_path: Path) -> None:
     result = read_input(scan)
 
     assert [record.data for record in result.raw_records] == [{"name": "b"}]
+
+
+def test_direct_input_reached_through_a_linked_parent_is_rejected(tmp_path: Path) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    real_file = real_dir / "a.json"
+    _write_json(real_file, {"a": 1})
+    linked_parent = tmp_path / "linked_parent"
+    _symlink(linked_parent, real_dir)
+
+    with pytest.raises(TriageInputError, match="reached through"):
+        read_input(linked_parent / "a.json")
+
+
+def test_normal_file_read_succeeds_with_identity_check_in_place(tmp_path: Path) -> None:
+    # Confirms the new pre/post-open identity comparison does not
+    # reject an ordinary, unmodified file -- only a genuine mismatch.
+    file_path = tmp_path / "one.json"
+    _write_json(file_path, {"host": "H1"})
+
+    result = read_input(file_path)
+
+    assert len(result.raw_records) == 1

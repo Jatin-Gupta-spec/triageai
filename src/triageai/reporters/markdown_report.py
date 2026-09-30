@@ -1,26 +1,17 @@
 """Markdown report rendering. Renders REDACTED copies only -- see the
 same caller responsibility note in terminal.py.
-
-Fix: every untrusted field is now sanitized via render_safety.py.
-Pipe escaping specifically defends the timeline table's structure; the
-same escaping is applied everywhere else in the report too (not just
-inside the literal table) because a raw newline in prose can still
-start a new Markdown line that renders as a heading if it happens to
-begin with '#' -- escaping a stray '|' outside a table is harmless, so
-using one consistent sanitizer everywhere is simpler and safer than
-having two subtly different ones.
 """
 
 from __future__ import annotations
 
-from triageai.models import AIAnalysisDraft, Case
+from triageai.models import AIDraftOutcome, Case
 from triageai.render_safety import sanitize_for_markdown_cell
 from triageai.reporters.timeline import build_timeline
 
 
-def render_markdown(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraft | None]) -> str:
+def render_markdown(cases: tuple[Case, ...], ai_drafts: dict[str, AIDraftOutcome]) -> str:
     """Render one section per case: severity/confidence, rule matches,
-    evidence gaps, observed facts, AI draft (or rejection notice), then
+    evidence gaps, observed facts, AI draft (or rejection reason), then
     a sorted event timeline table.
     """
     if not cases:
@@ -59,16 +50,24 @@ def render_markdown(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraf
             lines.extend(f"- {sanitize_for_markdown_cell(fact)}" for fact in case.observed_facts)
             lines.append("")
 
-        draft = ai_drafts.get(case.case_id)
+        outcome = ai_drafts.get(case.case_id)
         lines.append("### AI draft")
         lines.append("")
-        if draft is None:
+        if outcome is None or outcome.draft is None:
+            # See terminal.py's matching comment: outcome.rejection_reason
+            # is typed str | None regardless of draft's value, so a safe
+            # fallback is used whenever it isn't actually set.
+            reason = (
+                outcome.rejection_reason
+                if outcome is not None and outcome.rejection_reason is not None
+                else "no draft was generated"
+            )
             lines.append(
-                "> **REJECTED** -- the AI provider's output failed schema or evidence "
-                "validation and has been withheld. The deterministic evidence above is "
-                "unaffected."
+                f"> **REJECTED** -- {sanitize_for_markdown_cell(reason)}. The deterministic "
+                "evidence above is unaffected."
             )
         else:
+            draft = outcome.draft
             lines.append(f"**Summary:** {sanitize_for_markdown_cell(draft.summary)}")
             lines.append("")
             if draft.observations:
@@ -93,6 +92,16 @@ def render_markdown(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraf
                     f"- {sanitize_for_markdown_cell(step)}" for step in draft.recommended_next_steps
                 )
                 lines.append("")
+            if draft.evidence_gaps:
+                lines.append("**AI-proposed evidence gaps (unverified):**")
+                lines.extend(f"- {sanitize_for_markdown_cell(gap)}" for gap in draft.evidence_gaps)
+                lines.append("")
+            if draft.unsupported_claims:
+                lines.append("**AI-flagged unsupported claims:**")
+                lines.extend(
+                    f"- {sanitize_for_markdown_cell(claim)}" for claim in draft.unsupported_claims
+                )
+                lines.append("")
             lines.append(f"> {sanitize_for_markdown_cell(draft.analyst_warning)}")
             lines.append("")
 
@@ -115,9 +124,7 @@ def render_markdown(cases: tuple[Case, ...], ai_drafts: dict[str, AIAnalysisDraf
                 if event.command_line is not None
                 else "?"
             )
-            lines.append(
-                f"| {when} | {host} | {user} | {event_id} | {process} | {command_line} |"
-            )
+            lines.append(f"| {when} | {host} | {user} | {event_id} | {process} | {command_line} |")
         lines.append("")
 
     return "\n".join(lines)
