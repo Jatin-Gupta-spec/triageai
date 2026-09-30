@@ -1,1 +1,0 @@
-[{"host": "H1", "command_line": "echo schtasks /create"}, {"host": "H1", "command_line": "not-powershell.exe -enc AAAA"}]
