@@ -1,8 +1,8 @@
 # TriageAI v0.1 — Acceptance Record
 
 **Scope version:** v0.1
-**Date:** <2 OCT 2026>
-**Git commit:** <683b99cf87028ce91c08553959c62dcf123845c4>
+**Date:** 2 OCT 2026
+**Git commit:** '683b99cf87028ce91c08553959c62dcf123845c4'
 
 ## Supported platforms
 - OS: Ubuntu, Windows (CI-verified — see `.github/workflows/ci.yml`)
