@@ -133,3 +133,17 @@ has ever needed them.
 produces (shared constants, one definition, tested together). A real
 provider will not need to parse anything; this coupling is specific
 to the mock's role as a stand-in.
+
+
+## 13. A real provider must enforce limits during streaming, not only after
+
+Every size check in `output_validation.py` runs on the COMPLETE raw
+response text, after it has already been fully received from
+`AIProvider.generate()`. A naive v0.2+ implementation that streams a
+response token-by-token from a real network API, buffering the whole
+thing in Python before ever calling `validate_ai_output()`, would let
+an oversized or runaway response consume memory and time well before
+the 256 KiB check ever gets a chance to reject it. Any future
+streaming provider must enforce its own limit during the stream
+itself -- stop reading, not just reject afterward -- not rely on this
+module's post-hoc check alone.
